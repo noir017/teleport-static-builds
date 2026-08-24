@@ -69,13 +69,18 @@ grep -q 'gnu_get_libc_version' "$F.tmp" && die "移除后仍残留 gnu_get_libc_
 grep -q 'func (c \*fetchConfig) fetchOSVersion() string' "$F.tmp" \
   || die "误删了 fetchOSVersion —— awk 规则与上游新版本不匹配"
 
-# 连续空行收敛一下, 保持 gofmt 干净
-awk 'NF==0 { if (blank++) next } NF { blank=0 } { print }' "$F.tmp" > "$F"
+# 收敛连续空行, 并去掉 EOF 处的空行。
+# 后者是必须的: 被删掉的函数前面那个空行会留下来变成尾随空行, gofmt 不接受。
+awk 'NF==0 { if (blank++) next } NF { blank=0 } { print }' "$F.tmp" \
+  | awk '{ line[NR] = $0 } END { last = NR; while (last > 0 && line[last] ~ /^[[:space:]]*$/) last--; for (i = 1; i <= last; i++) print line[i] }' \
+  > "$F"
 rm -f "$F.tmp"
 note "已从 metadata_linux.go 移除 cgo"
 
 # ── 2. glibc 变体: 原实现 ──
 cat > "$PKG/metadata_linux_glibc.go" <<'EOF'
+//go:build linux && !musl
+
 /*
  * Teleport
  * Copyright (C) 2024  Gravitational, Inc.
@@ -93,8 +98,6 @@ cat > "$PKG/metadata_linux_glibc.go" <<'EOF'
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-//go:build linux && !musl
 
 package metadata
 
@@ -110,6 +113,8 @@ EOF
 
 # ── 3. musl 变体: 纯 Go ──
 cat > "$PKG/metadata_linux_musl.go" <<'EOF'
+//go:build linux && musl
+
 /*
  * Teleport
  * Copyright (C) 2024  Gravitational, Inc.
@@ -127,8 +132,6 @@ cat > "$PKG/metadata_linux_musl.go" <<'EOF'
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-//go:build linux && musl
 
 package metadata
 
@@ -145,10 +148,21 @@ EOF
 note "已生成 metadata_linux_glibc.go / metadata_linux_musl.go"
 
 # ── 4. 交给 Go 自己确认结果可用 ──
-# gofmt 能抓出 awk 破坏语法的情况; go list 能抓出 build tag 没选对文件的情况。
+# gofmt 能抓出 awk 破坏语法、以及 //go:build 位置不对之类的问题
+# (gofmt 要求 build 约束在文件最顶部, 在版权块注释之前)。
+#
+# ⚠️ 这项检查曾经因为"环境里没有 gofmt 就静默跳过"而让本地测试假绿。
+#    现在跳过时会明确出声, 别再把"没报错"当成"检查通过"。
 if command -v gofmt >/dev/null 2>&1; then
   bad="$(gofmt -l "$PKG" || true)"
-  [ -z "$bad" ] || die "生成的文件不符合 gofmt: $bad"
+  if [ -n "$bad" ]; then
+    printf '\n[apply-musl-patch] gofmt 差异:\n' >&2
+    for f in $bad; do gofmt -d "$f" >&2 || true; done
+    die "生成的文件不符合 gofmt: $bad"
+  fi
+  note "gofmt 检查通过"
+else
+  note "⚠️ 环境里没有 gofmt, 已跳过格式检查(不是通过)"
 fi
 
 note "完成"
