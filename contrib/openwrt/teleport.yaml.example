@@ -1,0 +1,48 @@
+# Teleport agent(仅 SSH 节点)配置示例 —— OpenWrt
+#
+# chmod 600。token 文件另存, 也要 600。
+#
+# 生成 join token(在控制面上):
+#   tctl tokens add --type=node --ttl=60m --format=text
+# 注册成功后凭据会写进 data_dir, 之后重启不再用 token, 过期也无妨。
+
+version: v3
+
+teleport:
+  # ⚠️ 必须全小写。节点名带大写字母时, 原生 ssh + ProxyCommand 会因为 OpenSSH
+  #    把 %h 小写化而报 "offline or does not exist", 极难排查。
+  nodename: openwrt
+
+  # 放在外挂盘上, 别放 overlay(空间小, 且固件升级会清)
+  data_dir: /mnt/sata2-4/apps/teleport/data
+
+  # 若代理前面有 nginx 之类的 L7 反代, 这里填反代的地址。
+  # 反向隧道走的是 tunnel_public_addr(默认 3024), 由代理在 /webapi/ping 里告知,
+  # 必须从本机可达 —— 控制面那边没发布 3024 的话, agent 会一直连不上,
+  # 而日志报的却是"token 过期", 完全误导。
+  proxy_server: teleport.example.lan:443
+
+  join_params:
+    method: token
+    token_name: /mnt/sata2-4/apps/teleport/token
+
+  log:
+    # ⚠️ 没有轮转。长期跑要自己加, 或改成 stderr 交给 procd 进 syslog
+    #    (syslog 是内存环形缓冲, 有界但会冲掉路由器自己的日志)。
+    output: /mnt/sata2-4/apps/teleport/teleport.log
+    severity: INFO
+
+# 本机只做 SSH 节点。控制面在别处(或同机的容器里), 别在这儿重复启用。
+auth_service:
+  enabled: "no"
+proxy_service:
+  enabled: "no"
+
+ssh_service:
+  enabled: "yes"
+  labels:
+    env: home
+    role: router
+    os: openwrt
+    arch: amd64
+    mode: agent

@@ -1,0 +1,307 @@
+# 拉上游 Teleport 源码 → 打 musl 补丁 → 编译成完全静态的二进制 → 发 Release。
+#
+# 本仓库不存放上游源码, 每次运行时按 tag 现拉。
+#
+# ── 为什么官方二进制在 OpenWrt / Termux 上跑不了 ──
+# 官方 Linux 包是 CGO 动态链接 glibc 的(ldd 可见 libc.so.6 / libresolv.so.2 /
+# libdl.so.2, interpreter /lib64/ld-linux-x86-64.so.2)。OpenWrt 只有 musl,
+# Android 只有 Bionic, 都没有 glibc, 官方包直接起不来。
+#
+# ── 为什么不能简单地 CGO_ENABLED=0 ──
+# 实测 v18.10.0 关掉 CGO 会打断 5 个包: lib/system(整包被 build 约束排除,
+# signal.go 是该目录唯一的非 Windows 文件且是 cgo)、lib/inventory/metadata、
+# session/uacc(还牵扯 mattn/go-sqlite3 非 cgo 桩缺 sqlite3.ErrReadonly)、
+# session/shell、lib/secretsscanner/authorizedkeys。
+#
+# ── 所以: 保留 CGO=1 换 musl-gcc, 只改一个包 ──
+# 上面 5 个包里除 metadata 外用的是 <signal.h>/<utmp.h>/<pwd.h>, musl 全都提供,
+# 一行不用改就编过。详见 scripts/apply-musl-patch.sh。
+#
+# ── 架构 ──
+# 两个架构都在**各自的原生 runner** 上用原生 musl-gcc 编译, 不做交叉编译、
+# 不需要 zig。arm64 用 GitHub 的免费 arm64 runner(仅 public 仓库)。
+
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '上游 tag (留空 = 自动取最新正式版, 忽略 rc/alpha)'
+        required: false
+        default: ''
+      publish:
+        description: '编译成功后发 Release'
+        type: boolean
+        default: true
+      force:
+        description: '同名 Release 已存在时覆盖重发'
+        type: boolean
+        default: false
+
+  # 想每周自动跟进上游就取消下面两行的注释。
+  # 默认关着: 定时任务会在无人看管时对外发布 Release, 那应该是一个明确的选择,
+  # 而不是装上就默认打开的东西。
+  # schedule:
+  #   - cron: '17 4 * * 1'
+
+permissions:
+  contents: write   # 发 Release 需要
+
+env:
+  UPSTREAM: https://github.com/gravitational/teleport.git
+
+jobs:
+  # ───────────────────────────────────────────────────────────
+  # 决定要构建哪个版本, 并判断是否已经发过
+  # ───────────────────────────────────────────────────────────
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      ref:     ${{ steps.pick.outputs.ref }}
+      version: ${{ steps.pick.outputs.version }}
+      skip:    ${{ steps.pick.outputs.skip }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ inputs.upstream_ref }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$WANT" ]; then
+            REF="$WANT"
+            echo "使用指定的 ref: $REF"
+          else
+            # 只认 vX.Y.Z, 排除 rc/alpha/beta 之类
+            REF=$(git ls-remote --tags --refs "$UPSTREAM" 'v*' \
+                  | awk '{print $2}' | sed 's#refs/tags/##' \
+                  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                  | sort -V | tail -1)
+            [ -n "$REF" ] || { echo "::error::没能从上游解析出任何正式版 tag"; exit 1; }
+            echo "自动选中上游最新正式版: $REF"
+          fi
+
+          # 确认这个 ref 在上游真实存在, 免得后面 clone 到一半才失败
+          git ls-remote --exit-code --tags "$UPSTREAM" "refs/tags/$REF" >/dev/null \
+            || { echo "::error::上游没有 tag $REF"; exit 1; }
+
+          echo "ref=$REF"          >> "$GITHUB_OUTPUT"
+          echo "version=${REF#v}"  >> "$GITHUB_OUTPUT"
+
+          # 已发过就跳过, 除非 force
+          if gh release view "$REF" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$FORCE" = "true" ]; then
+              echo "::warning::Release $REF 已存在, force=true, 将覆盖重发"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::notice::Release $REF 已存在, 跳过。要重建请用 force=true。"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ───────────────────────────────────────────────────────────
+  # 各架构在自己的原生 runner 上编译
+  # ───────────────────────────────────────────────────────────
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    strategy:
+      fail-fast: false     # 一个架构挂了也要看到另一个的结果
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      REF: ${{ needs.resolve.outputs.ref }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: 检出本仓库(补丁与脚本)
+        uses: actions/checkout@v4
+
+      - name: 确认 runner 架构与目标一致
+        run: |
+          set -euo pipefail
+          want="$ARCH"; got="$(uname -m)"
+          case "$got" in
+            x86_64)  have=amd64 ;;
+            aarch64) have=arm64 ;;
+            *)       echo "::error::未知的 runner 架构 $got"; exit 1 ;;
+          esac
+          [ "$have" = "$want" ] || {
+            echo "::error::runner 是 $have 但目标是 $want —— 本 workflow 只做原生编译, 不交叉编译"
+            exit 1
+          }
+          echo "runner=$got → $have (符合)"
+
+      - name: 拉取上游源码
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$REF" "$UPSTREAM" src
+          echo "commit = $(git -C src rev-parse HEAD)"
+          echo "go.mod = $(grep -m1 '^go ' src/go.mod)"
+
+      - name: 打 musl 补丁
+        run: bash scripts/apply-musl-patch.sh src
+
+      - name: 安装 musl 工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+          musl-gcc --version | head -1
+
+      - name: 安装 Go(版本取自上游 go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - name: 确认 build tag 选中了正确的文件变体
+        working-directory: src
+        env:
+          CGO_ENABLED: '1'
+          CC: musl-gcc
+        run: |
+          set -euo pipefail
+          # 期望: metadata 包在 musl tag 下没有任何 cgo 文件
+          go list -tags musl -f 'metadata => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./lib/inventory/metadata
+          # 期望: lib/system 仍是 cgo(signal.h, musl 有)
+          go list -tags musl -f 'system   => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./lib/system
+          if go list -tags musl -f '{{.CgoFiles}}' ./lib/inventory/metadata | grep -q glibc; then
+            echo "::error::musl tag 没生效, 仍在编 glibc 变体"; exit 1
+          fi
+
+      - name: 编译
+        working-directory: src
+        env:
+          CGO_ENABLED: '1'
+          CC: musl-gcc
+        run: |
+          set -euo pipefail
+          # -X 的符号是 version.go 里的 `var Gitref string`(大写 G)。
+          # 写错路径 Go 不报错、只是静默失效, 所以别凭印象改。
+          go build -v -trimpath -tags musl \
+            -ldflags="-s -w -linkmode external -extldflags -static -X github.com/gravitational/teleport.Gitref=$REF" \
+            -o ../teleport ./tool/teleport
+
+      - name: 验证产物真的是静态的
+        run: |
+          set -euo pipefail
+          file teleport
+          if readelf -d teleport 2>/dev/null | grep -q NEEDED; then
+            echo "::error::产物仍有动态依赖, 在 OpenWrt/Termux 上会起不来"
+            readelf -d teleport | grep NEEDED
+            exit 1
+          fi
+          echo "无 NEEDED 条目(符合预期)"
+          # runner 与目标同架构, 直接跑一遍
+          ./teleport version
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          NAME="teleport-${VERSION}-linux-${ARCH}-static"
+          mkdir -p "dist/$NAME"
+          cp teleport "dist/$NAME/"
+          cp README.md "dist/$NAME/" 2>/dev/null || true
+          tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
+          rm -rf "dist/$NAME"
+          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          # 未压缩二进制的校验和也留一份: 用户解包后可以直接核对
+          sha256sum teleport | awk -v n="$NAME" '{print $1"  "n"/teleport"}' \
+            >> "dist/${NAME}.tar.gz.sha256"
+          ls -la dist
+          cat "dist/${NAME}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────
+  # 两个架构都成功才发 Release(缺架构的 Release 比没有更坑人)
+  # ───────────────────────────────────────────────────────────
+  release:
+    needs: [resolve, build]
+    # 定时触发时 inputs 是空的, 若写成 `&& inputs.publish` 会永远为假 ——
+    # 那会让启用 schedule 的人得到"构建成功但永远不发版"的哑故障。
+    if: >-
+      needs.resolve.outputs.skip != 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.publish)
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REF: ${{ needs.resolve.outputs.ref }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      FORCE: ${{ inputs.force }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+          merge-multiple: true
+
+      - name: 汇总
+        run: |
+          set -euo pipefail
+          ls -la dl
+          cat dl/*.sha256 > SHA256SUMS
+          echo "=== SHA256SUMS ==="; cat SHA256SUMS
+
+      - name: 写 Release 说明
+        run: |
+          set -euo pipefail
+          # 用 quoted heredoc + 占位符: 正文里有大量反引号和 $, 让 shell 去展开
+          # 只会自找麻烦(反引号会变成命令替换)。
+          cat > notes.md <<'EOF'
+          上游 [`@REF@`](https://github.com/gravitational/teleport/releases/tag/@REF@) 的**完全静态**构建，
+          用于官方包跑不了的平台（OpenWrt/musl、Termux/Bionic 等）。
+
+          只含 `teleport`（agent），不含 `tsh` / `tctl`。
+
+          ## 与官方包的差别
+
+          - 静态链接，`readelf -d` 无 `NEEDED` 条目，不依赖目标系统的 libc
+          - `lib/inventory/metadata` 的 glibc 版本探测在 musl 下返回空串
+            （musl 不导出运行时版本查询接口），其余源码与上游一致
+          - 体积与官方包基本相同（静态链接只多约 1.3MB）
+
+          ## 校验
+
+          ```
+          sha256sum -c SHA256SUMS
+          ```
+
+          ## 安装
+
+          见仓库 README 与 `contrib/`。
+
+          ---
+          由 `.github/workflows/build.yml` 自动构建。
+          上游版权与许可归 Gravitational, Inc.（AGPL-3.0）。
+          EOF
+          sed -i "s#@REF@#${REF}#g; s#@VERSION@#${VERSION}#g" notes.md
+          cat notes.md
+
+      - name: 发布
+        run: |
+          set -euo pipefail
+          if [ "$FORCE" = "true" ] && gh release view "$REF" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "删除已存在的 Release $REF (force)"
+            gh release delete "$REF" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$REF" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Teleport $VERSION (static)" \
+            --notes-file notes.md \
+            dl/*.tar.gz SHA256SUMS
+          gh release view "$REF" --repo "$GITHUB_REPOSITORY"
