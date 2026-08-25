@@ -3,6 +3,16 @@
 **状态：已在 redroid (Android 13 / arm64) 容器里实测启动成功，但未在真机 Termux 里验证。**
 两者的差距不小，下面的风险一节请先读完。
 
+## 两个东西，装哪个都行
+
+| | 二进制 | 做什么 | 体积 |
+|---|---|---|---|
+| **agent** | `teleport` | 把这台手机变成集群里的一个 SSH 节点，**别人能连进来** | ~450MB |
+| **客户端** | `tsh` | 从手机**连出去**，登录集群里的其它节点 | 小得多 |
+
+两者互不依赖，只装一个完全正常。多数人想要的其实是客户端。
+下面关于 Bionic 的所有讨论对两者同样适用。
+
 ## 这个产物和另外两个不一样
 
 | 产物 | 链接方式 | 目标 |
@@ -60,24 +70,38 @@ bash ~/termux-agent.sh ssh
 bash ~/termux-agent.sh ssh "$(cat ~/.ssh/id_ed25519.pub)"   # 电脑上的公钥内容
 ```
 
-### 第 2 步：从电脑 ssh 进去，剩下的一条命令
+### 第 2 步：从电脑 ssh 进去
 
 ```sh
 ssh u0_aNNN@<手机IP> -p 8022
+```
 
+**只想要客户端**（从手机登录集群里的其它机器）：
+
+```sh
+bash ~/termux-agent.sh client
+tsh login --proxy=teleport.example.com:443 --user=<你的用户名>
+tsh ls
+```
+
+**想把手机变成集群节点**（别人能 ssh 进这台手机）：
+
+```sh
 bash ~/termux-agent.sh all \
   --proxy teleport.example.com:443 \
   --token <tctl tokens add --type=node 给的 token>
 ```
 
-`all` = `install` → `configure` → `verify` → `service` → `boot`。
+`all` = `install` → `configure` → `verify` → `service` → `boot`，只管 agent，
+**不会顺带装客户端** —— 两者用途不同，不该硬绑在一起。
 
 ### 单步子命令
 
 | 子命令 | 做什么 |
 |---|---|
 | `ssh [公钥]` | 装 sshd、写 authorized_keys（幂等）、打印连接命令 |
-| `install` | 查架构/API/空间 → 下载 → **校验 sha256** → 解包 → `teleport version` |
+| `install` | 装 agent：查架构/API/空间 → 下载 → **校验 sha256** → 解包 → `teleport version` |
+| `client` | 装客户端 `tsh`，并链到 `$PREFIX/bin/tsh`（在 PATH 上） |
 | `configure` | 生成 `~/.teleport/teleport.yaml` 和 600 权限的 token 文件 |
 | `verify` | 试启动 45 秒，判断到底是"没加入集群"还是"根本没起来" |
 | `service` | 写 runit service + 持 wake lock + 提示关电池优化 |
@@ -153,6 +177,19 @@ ssh_service:
 ⚠️ **能登录的账号只有 Termux 自己那个**（Bionic 合成的 `u0_aNNN`）。
 用 `id -un` 查出实际名字，让 Teleport 角色的 `logins` 里包含它。
 Android 上没有别的用户可切，也没有 root。
+
+## 客户端 tsh 在 Termux 上的几点
+
+- **凭据在 `~/.tsh`**，和 agent 的 `~/.teleport` 完全无关。
+- **SSO 登录要开浏览器。** Termux 的 `termux-tools` 自带 `xdg-open`，
+  `tsh login` 一般能直接把系统浏览器拉起来。拉不起来就加 `--browser=none`，
+  tsh 会把 URL 打印出来让你自己复制。
+- **不支持硬件密钥**（PIV / YubiKey）：产物没有编 `piv` build tag，
+  Android 上也没有读卡器。集群若强制 hardware key，这个 `tsh` 登不上去。
+- **`tsh` 不需要 wake lock、也不用关电池优化** —— 它是前台交互工具，用完就退出。
+  下面那些常驻相关的坑只对 agent 有意义。
+- `tsh ssh` 开的是普通 PTY，Termux 里应该正常，但**这条没在真机验过**，
+  见后面「redroid 覆盖不到的三件事」。
 
 ## 自启
 

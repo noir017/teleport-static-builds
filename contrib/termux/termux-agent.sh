@@ -3,9 +3,10 @@
 # Teleport agent on Termux —— 从干净环境到节点上线的全流程
 #
 #   bash termux-agent.sh ssh          先把 sshd 支起来, 之后别再对着手机键盘敲
-#   bash termux-agent.sh all          install + configure + verify + service
+#   bash termux-agent.sh all          install + configure + verify + service (agent)
+#   bash termux-agent.sh client       只装客户端 tsh, 和 agent 互不依赖
 #
-# 单步:  install | configure | service | boot | verify | status | logs | uninstall
+# 单步:  install | client | configure | service | boot | verify | status | logs | uninstall
 #
 # 全流程说明见同目录 README.md。
 set -euo pipefail
@@ -15,6 +16,8 @@ REPO="noir017/teleport-static-builds"
 
 OPT="$PREFIX/opt/teleport"
 BIN="$OPT/teleport"
+TSH="$OPT/tsh"
+TSH_LINK="$PREFIX/bin/tsh"
 CFG_DIR="$HOME/.teleport"
 CFG="$CFG_DIR/teleport.yaml"
 TOKEN_FILE="$CFG_DIR/token"
@@ -22,8 +25,10 @@ DATA_DIR="$CFG_DIR/data"
 SVC_DIR="$PREFIX/var/service/teleport"
 LOG_DIR="$PREFIX/var/log/teleport"
 
-# 需要的最小可用空间(KB): tarball ~105M + 解包 ~450M + 余量
-NEED_KB=$((1200 * 1024))
+# 需要的最小可用空间(KB)。teleport: tarball ~105M + 解包 ~450M + 余量。
+# tsh 小得多, 但仍按宽松值要, 手机上空间不够时中途失败最难受。
+NEED_KB_teleport=$((1200 * 1024))
+NEED_KB_tsh=$((600 * 1024))
 
 c_r=$'\033[31m'; c_g=$'\033[32m'; c_y=$'\033[33m'; c_b=$'\033[1m'; c_0=$'\033[0m'
 say()  { printf '%s==>%s %s\n' "$c_b" "$c_0" "$*"; }
@@ -127,31 +132,35 @@ resolve_version() {
   printf '%s' "$v"
 }
 
-cmd_install() {
-  check_env
-  pkg_need curl curl
-  pkg_need tar tar
-
+check_space() {
+  # check_space <需要的KB>
   local free_kb
   free_kb="$(df -Pk "$PREFIX" | awk 'NR==2{print $4}')"
-  if [ "${free_kb:-0}" -lt "$NEED_KB" ]; then
-    die "空间不够: $PREFIX 剩 $((free_kb/1024))MB, 至少要 $((NEED_KB/1024))MB。
-        二进制本体就 ~450MB。"
+  if [ "${free_kb:-0}" -lt "$1" ]; then
+    die "空间不够: $PREFIX 剩 $((free_kb/1024))MB, 至少要 $(($1/1024))MB。"
   fi
   ok "可用空间 $((free_kb/1024))MB"
+}
 
-  local tag ver dir tgz base url tmp
+fetch_tool() {
+  # fetch_tool <teleport|tsh> —— 下载 + 双重校验 + 解包到 $OPT/<tool>
+  local tool="$1"
+  local tag ver dir tgz base tmp want_bin got_bin
+
   tag="$(resolve_version)"
   ver="${tag#v}"
-  dir="teleport-${ver}-android-arm64"
+  dir="${tool}-${ver}-android-arm64"
   tgz="${dir}.tar.gz"
   base="https://github.com/$REPO/releases/download/$tag"
-  say "安装 Teleport $tag (android/arm64)"
+  say "安装 $tool $tag (android/arm64)"
 
   tmp="$(mktemp -d "$PREFIX/tmp/tp.XXXXXX")"
-  trap 'rm -rf "$tmp"' RETURN
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
 
-  curl -fSL --retry 3 -o "$tmp/$tgz" "$base/$tgz" || die "下载失败: $base/$tgz"
+  curl -fSL --retry 3 -o "$tmp/$tgz" "$base/$tgz" || die "下载失败: $base/$tgz
+        这个 tag 可能没有 $tool 产物 —— 客户端是后加的, 老版本 Release 里没有。
+        用 TELEPORT_VERSION=vX.Y.Z 指定一个更新的版本。"
   curl -fsSL --retry 3 -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || die "下载 SHA256SUMS 失败"
 
   say "校验压缩包"
@@ -160,25 +169,75 @@ cmd_install() {
     || die "$tgz 校验不通过 —— 下载损坏或产物被改过, 别用。"
   ok "压缩包 sha256 正确"
 
-  rm -rf "$OPT"; mkdir -p "$OPT"
-  say "解包 (~450MB, 手机上要等一会)"
-  tar xzf "$tmp/$tgz" -C "$OPT" --strip-components=1
-  chmod 755 "$BIN"
+  say "解包"
+  mkdir -p "$tmp/x"
+  tar xzf "$tmp/$tgz" -C "$tmp/x" --strip-components=1
+  [ -f "$tmp/x/$tool" ] || die "包里没有 $tool"
 
   # SHA256SUMS 里同时记了解包后二进制的哈希, 顺手把它也验了
-  local want_bin got_bin
-  want_bin="$(awk -v p="$dir/teleport" '$2==p{print $1}' "$tmp/SHA256SUMS")"
+  want_bin="$(awk -v p="$dir/$tool" '$2==p{print $1}' "$tmp/SHA256SUMS")"
   if [ -n "$want_bin" ]; then
-    got_bin="$(sha256sum "$BIN" | awk '{print $1}')"
-    [ "$want_bin" = "$got_bin" ] || die "解包出来的二进制哈希对不上, 中止。"
+    got_bin="$(sha256sum "$tmp/x/$tool" | awk '{print $1}')"
+    [ "$want_bin" = "$got_bin" ] || die "解包出来的 $tool 哈希对不上, 中止。"
     ok "二进制 sha256 正确"
+  else
+    warn "SHA256SUMS 里没有 $dir/$tool 这一条, 只校验了压缩包"
   fi
+
+  mkdir -p "$OPT"
+  mv -f "$tmp/x/$tool" "$OPT/$tool"
+  chmod 755 "$OPT/$tool"
+  ok "已装到 $OPT/$tool ($(du -h "$OPT/$tool" | cut -f1))"
+}
+
+cmd_install() {
+  check_env
+  pkg_need curl curl
+  pkg_need tar tar
+  check_space "$NEED_KB_teleport"
+  fetch_tool teleport
 
   say "第一道验证: 能不能在这台设备上执行"
   "$BIN" version || die "二进制跑不起来。
         这是最关键的一道门, 没过就不用往下走了 —— 多半是 Android 版本或
         SELinux 拦了。把上面的报错发出来。"
   ok "$($BIN version | head -1)"
+}
+
+# ---------------------------------------------------------------- 客户端 tsh
+
+cmd_client() {
+  check_env
+  pkg_need curl curl
+  pkg_need tar tar
+  check_space "$NEED_KB_tsh"
+  fetch_tool tsh
+
+  say "第一道验证: 能不能在这台设备上执行"
+  "$TSH" version || die "tsh 跑不起来。把上面的报错发出来。"
+
+  mkdir -p "$PREFIX/bin"
+  ln -sf "$TSH" "$TSH_LINK"
+  ok "已把 tsh 链到 $TSH_LINK (在 PATH 里)"
+
+  cat <<EOF
+
+  ${c_b}用法${c_0}
+
+      tsh login --proxy=teleport.example.com:443 --user=<你的用户名>
+      tsh ls
+      tsh ssh <login>@<node>
+
+  凭据存在 ${c_b}~/.tsh${c_0}, 和 agent 的 ~/.teleport 无关 —— 客户端和 agent
+  可以只装一个。
+
+  ${c_y}SSO 登录要开浏览器${c_0}: Termux 的 termux-tools 自带 xdg-open, 正常能拉起。
+  拉不起来就加 ${c_b}--browser=none${c_0}, tsh 会把 URL 打出来让你自己复制。
+
+  ${c_y}不支持硬件密钥${c_0}(PIV / YubiKey): 没编 piv tag, Android 也没有读卡器。
+  集群若强制 hardware key, 这个 tsh 登不上。
+
+EOF
 }
 
 # ------------------------------------------------------------------- 配置
@@ -403,8 +462,21 @@ EOF
 EOF
 }
 
+show_tool() {
+  # show_tool <标签> <路径> —— "存在但跑不起来"要和"没装"分开报, 两者的下一步完全不同
+  printf '%s: ' "$1"
+  if [ ! -x "$2" ]; then echo "未安装"; return; fi
+  local v
+  if v="$("$2" version 2>/dev/null | head -1)" && [ -n "$v" ]; then
+    echo "$v"
+  else
+    echo "文件在但执行失败 —— $2"
+  fi
+}
+
 cmd_status() {
-  printf '二进制  : '; [ -x "$BIN" ] && "$BIN" version | head -1 || echo "未安装"
+  show_tool 'agent   ' "$BIN"
+  show_tool '客户端  ' "$TSH"
   printf '配置    : '; [ -f "$CFG" ] && awk '/nodename:|proxy_server:/{printf "%s ", $2}END{print ""}' "$CFG" || echo "未配置"
   printf '进程    : '; pgrep -f "$BIN" >/dev/null && echo "在跑 (pid $(pgrep -f "$BIN" | tr '\n' ' '))" || echo "没跑"
   printf '服务    : '
@@ -430,6 +502,8 @@ cmd_uninstall() {
   pkill -f "$BIN" 2>/dev/null || true
   rm -rf "$SVC_DIR"
   say "删二进制 $OPT"
+  # 软链指向 $OPT 里的 tsh, 删目录前先摘掉, 免得留一条断链在 PATH 上
+  [ -L "$TSH_LINK" ] && rm -f "$TSH_LINK"
   rm -rf "$OPT"
   warn "配置和数据保留在 $CFG_DIR —— 里面有 join token 和主机身份。"
   warn "确定不要了就自己 rm -rf $CFG_DIR"
@@ -452,7 +526,8 @@ Teleport agent on Termux
 
   bash $0 ssh [公钥]                     装 sshd, 之后从电脑操作
   bash $0 all --proxy H:443 --token T    一条龙
-  bash $0 install                        下载校验解包, 验证能执行
+  bash $0 install                        下载校验解包 agent, 验证能执行
+  bash $0 client                         只装客户端 tsh (与 agent 互不依赖)
   bash $0 configure --proxy H:443 --token T [--nodename N]
   bash $0 verify                         试启动 45s, 判断有没有加入集群
   bash $0 service                        runit 常驻 + wake lock
@@ -468,6 +543,7 @@ sub="${1:-}"; shift || true
 case "$sub" in
   ssh)       cmd_ssh "$@" ;;
   install)   cmd_install ;;
+  client)    cmd_client ;;
   configure) cmd_configure "$@" ;;
   verify)    cmd_verify ;;
   service)   cmd_service ;;

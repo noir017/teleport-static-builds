@@ -2,9 +2,15 @@
 #
 # 本仓库不存放上游源码, 每次运行时按 tag 现拉。
 #
-# 三个产物, 分两类:
+# 产物矩阵 = {teleport(agent), tsh(客户端)} x {linux-amd64-static,
+# linux-arm64-static, android-arm64}, 每个组合一个 tar.gz。分两类:
 #   linux-amd64-static / linux-arm64-static  静态 musl, 不依赖目标系统 libc
 #   android-arm64                            动态链接 Bionic (Termux)
+#
+# 一个工具一个包, 不合并: teleport 约 450MB, 只想要客户端的人不该被迫下它。
+# tsh 的 cgo 依赖面是 teleport 的**真子集**(runtime/cgo, net, session/shell,
+# plugin), 不碰任何被补丁改过的包 —— 所以它能编过是 teleport 能编过的推论。
+# tctl 没有构建: 它是管理端工具, 放在非 glibc 的路由器/手机上没有实际用途。
 # 后者刻意不是静态的 —— 原因见 build_termux job 顶部的注释, 一句话是
 # Android 既没有 /etc/passwd 也没有 /etc/resolv.conf, 必须靠 Bionic 兜底。
 #
@@ -48,6 +54,10 @@ on:
         default: false
       include_termux:
         description: '同时构建 Termux(Android/Bionic) 目标'
+        type: boolean
+        default: true
+      include_tsh:
+        description: '同时构建客户端 tsh(每个目标各一份)'
         type: boolean
         default: true
 
@@ -135,6 +145,9 @@ jobs:
       REF: ${{ needs.resolve.outputs.ref }}
       VERSION: ${{ needs.resolve.outputs.version }}
       ARCH: ${{ matrix.arch }}
+      # 定时触发时 inputs 是空的 —— 直接写 `inputs.include_tsh` 会永远为假,
+      # 和 release 那边记着的坑是同一个。
+      TOOLS: ${{ (github.event_name != 'workflow_dispatch' || inputs.include_tsh) && 'teleport tsh' || 'teleport' }}
     steps:
       - name: 检出本仓库(补丁与脚本)
         uses: actions/checkout@v4
@@ -200,38 +213,51 @@ jobs:
           set -euo pipefail
           # -X 的符号是 version.go 里的 `var Gitref string`(大写 G)。
           # 写错路径 Go 不报错、只是静默失效, 所以别凭印象改。
-          go build -v -trimpath -tags musl \
-            -ldflags="-s -w -linkmode external -extldflags -static -X github.com/gravitational/teleport.Gitref=$REF" \
-            -o ../teleport ./tool/teleport
+          echo "要编的工具: $TOOLS"
+          for t in $TOOLS; do
+            echo "::group::编译 $t"
+            go build -v -trimpath -tags musl \
+              -ldflags="-s -w -linkmode external -extldflags -static -X github.com/gravitational/teleport.Gitref=$REF" \
+              -o "../$t" "./tool/$t"
+            echo "::endgroup::"
+          done
 
       - name: 验证产物真的是静态的
         run: |
           set -euo pipefail
-          file teleport
-          if readelf -d teleport 2>/dev/null | grep -q NEEDED; then
-            echo "::error::产物仍有动态依赖, 在 OpenWrt/Termux 上会起不来"
-            readelf -d teleport | grep NEEDED
-            exit 1
-          fi
-          echo "无 NEEDED 条目(符合预期)"
-          # runner 与目标同架构, 直接跑一遍
-          ./teleport version
+          for t in $TOOLS; do
+            echo "=== $t ==="
+            file "$t"
+            if readelf -d "$t" 2>/dev/null | grep -q NEEDED; then
+              echo "::error::$t 仍有动态依赖, 在 OpenWrt/Termux 上会起不来"
+              readelf -d "$t" | grep NEEDED
+              exit 1
+            fi
+            echo "无 NEEDED 条目(符合预期)"
+            # runner 与目标同架构, 直接跑一遍
+            "./$t" version
+            ls -l "$t"
+          done
 
       - name: 打包
         run: |
           set -euo pipefail
-          NAME="teleport-${VERSION}-linux-${ARCH}-static"
-          mkdir -p "dist/$NAME"
-          cp teleport "dist/$NAME/"
-          cp README.md "dist/$NAME/" 2>/dev/null || true
-          tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
-          rm -rf "dist/$NAME"
-          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
-          # 未压缩二进制的校验和也留一份: 用户解包后可以直接核对
-          sha256sum teleport | awk -v n="$NAME" '{print $1"  "n"/teleport"}' \
-            >> "dist/${NAME}.tar.gz.sha256"
+          # 一个工具一个包: 只要客户端的人不该被迫下 450MB 的 agent
+          mkdir -p dist
+          for t in $TOOLS; do
+            NAME="${t}-${VERSION}-linux-${ARCH}-static"
+            mkdir -p "dist/$NAME"
+            cp "$t" "dist/$NAME/"
+            cp README.md "dist/$NAME/" 2>/dev/null || true
+            tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
+            rm -rf "dist/$NAME"
+            ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+            # 未压缩二进制的校验和也留一份: 用户解包后可以直接核对
+            sha256sum "$t" | awk -v n="$NAME" -v b="$t" '{print $1"  "n"/"b}' \
+              >> "dist/${NAME}.tar.gz.sha256"
+          done
           ls -la dist
-          cat "dist/${NAME}.tar.gz.sha256"
+          cat dist/*.sha256
 
       - uses: actions/upload-artifact@v4
         with:
@@ -265,6 +291,7 @@ jobs:
       REF: ${{ needs.resolve.outputs.ref }}
       VERSION: ${{ needs.resolve.outputs.version }}
       ARCH: arm64
+      TOOLS: ${{ (github.event_name != 'workflow_dispatch' || inputs.include_tsh) && 'teleport tsh' || 'teleport' }}
     steps:
       - name: 检出本仓库(补丁与脚本)
         uses: actions/checkout@v4
@@ -339,48 +366,60 @@ jobs:
         run: |
           set -euo pipefail
           # 不加 -extldflags -static: 见本 job 顶部注释, Android 上必须动态链接 Bionic
-          go build -v -trimpath \
-            -ldflags="-s -w -X github.com/gravitational/teleport.Gitref=$REF" \
-            -o ../teleport ./tool/teleport
+          echo "要编的工具: $TOOLS"
+          for t in $TOOLS; do
+            echo "::group::编译 $t"
+            go build -v -trimpath \
+              -ldflags="-s -w -X github.com/gravitational/teleport.Gitref=$REF" \
+              -o "../$t" "./tool/$t"
+            echo "::endgroup::"
+          done
 
       - name: 验证产物是 Android 二进制
         run: |
           set -euo pipefail
-          file teleport
-          # 决定性判据: 解释器必须是 Android 的 linker64
-          interp="$(readelf -l teleport | sed -n 's/.*interpreter: \(.*\)\]/\1/p')"
-          echo "interpreter = ${interp:-<none>}"
-          case "$interp" in
-            /system/bin/linker64) : ;;
-            *) echo "::error::解释器是 '${interp:-<none>}', 期望 /system/bin/linker64"; exit 1 ;;
-          esac
-          echo "--- NEEDED ---"
-          readelf -d teleport | grep NEEDED || true
-          # Bionic 的 libc 就叫 libc.so; 出现 libc.so.6 说明误链到了 glibc
-          readelf -d teleport | grep -q 'NEEDED.*\[libc\.so\]' \
-            || { echo "::error::没有链接 Bionic 的 libc.so"; exit 1; }
-          if readelf -d teleport | grep -qE '\[libc\.so\.6\]|\[ld-linux'; then
-            echo "::error::链到了 glibc, 这在 Android 上跑不了"; exit 1
-          fi
+          for t in $TOOLS; do
+            echo "=== $t ==="
+            file "$t"
+            # 决定性判据: 解释器必须是 Android 的 linker64
+            interp="$(readelf -l "$t" | sed -n 's/.*interpreter: \(.*\)\]/\1/p')"
+            echo "interpreter = ${interp:-<none>}"
+            case "$interp" in
+              /system/bin/linker64) : ;;
+              *) echo "::error::$t 的解释器是 '${interp:-<none>}', 期望 /system/bin/linker64"; exit 1 ;;
+            esac
+            echo "--- NEEDED ---"
+            readelf -d "$t" | grep NEEDED || true
+            # Bionic 的 libc 就叫 libc.so; 出现 libc.so.6 说明误链到了 glibc
+            readelf -d "$t" | grep -q 'NEEDED.*\[libc\.so\]' \
+              || { echo "::error::$t 没有链接 Bionic 的 libc.so"; exit 1; }
+            if readelf -d "$t" | grep -qE '\[libc\.so\.6\]|\[ld-linux'; then
+              echo "::error::$t 链到了 glibc, 这在 Android 上跑不了"; exit 1
+            fi
+            ls -l "$t"
+          done
           echo "确认: Android arm64 动态可执行文件"
-          # ⚠️ runner 是 Linux/x86_64, 跑不了这个二进制 ——
+          # ⚠️ runner 是 Linux/x86_64, 跑不了这些二进制 ——
           #    与静态构建不同, 本 job **没有** 冒烟测试, 真机验证是必需的。
           echo "::notice::Android 二进制无法在 runner 上执行, 未做冒烟测试"
 
       - name: 打包
         run: |
           set -euo pipefail
-          NAME="teleport-${VERSION}-android-arm64"
-          mkdir -p "dist/$NAME"
-          cp teleport "dist/$NAME/"
-          cp contrib/termux/README.md "dist/$NAME/" 2>/dev/null || true
-          tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
-          rm -rf "dist/$NAME"
-          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
-          sha256sum teleport | awk -v n="$NAME" '{print $1"  "n"/teleport"}' \
-            >> "dist/${NAME}.tar.gz.sha256"
+          mkdir -p dist
+          for t in $TOOLS; do
+            NAME="${t}-${VERSION}-android-arm64"
+            mkdir -p "dist/$NAME"
+            cp "$t" "dist/$NAME/"
+            cp contrib/termux/README.md "dist/$NAME/" 2>/dev/null || true
+            tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
+            rm -rf "dist/$NAME"
+            ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+            sha256sum "$t" | awk -v n="$NAME" -v b="$t" '{print $1"  "n"/"b}' \
+              >> "dist/${NAME}.tar.gz.sha256"
+          done
           ls -la dist
-          cat "dist/${NAME}.tar.gz.sha256"
+          cat dist/*.sha256
 
       - uses: actions/upload-artifact@v4
         with:
@@ -434,15 +473,20 @@ jobs:
           上游 [`@REF@`](https://github.com/gravitational/teleport/releases/tag/@REF@) 的构建，
           用于官方包跑不了的平台（OpenWrt/musl、Termux/Bionic）。
 
-          只含 `teleport`（agent），不含 `tsh` / `tctl`。
+          含 `teleport`（agent）与 `tsh`（客户端），**分开打包**——
+          只想要客户端的人不必下 450MB 的 agent。不含 `tctl`（管理端工具，
+          放在路由器/手机上没有实际用途）。
 
           ## 产物
 
-          | 文件 | 链接方式 | 平台 |
-          |---|---|---|
-          | `teleport-@VERSION@-linux-amd64-static.tar.gz` | 静态 musl | x86_64 OpenWrt / 软路由 |
-          | `teleport-@VERSION@-linux-arm64-static.tar.gz` | 静态 musl | arm64 OpenWrt / 树莓派 / proot-distro |
-          | `teleport-@VERSION@-android-arm64.tar.gz` | **动态 Bionic** | Termux（原生） |
+          | 文件 | 内容 | 链接方式 | 平台 |
+          |---|---|---|---|
+          | `teleport-@VERSION@-linux-amd64-static.tar.gz` | agent | 静态 musl | x86_64 OpenWrt / 软路由 |
+          | `teleport-@VERSION@-linux-arm64-static.tar.gz` | agent | 静态 musl | arm64 OpenWrt / 树莓派 / proot-distro |
+          | `teleport-@VERSION@-android-arm64.tar.gz` | agent | **动态 Bionic** | Termux（原生） |
+          | `tsh-@VERSION@-linux-amd64-static.tar.gz` | 客户端 | 静态 musl | 同上 |
+          | `tsh-@VERSION@-linux-arm64-static.tar.gz` | 客户端 | 静态 musl | 同上 |
+          | `tsh-@VERSION@-android-arm64.tar.gz` | 客户端 | **动态 Bionic** | Termux（原生） |
 
           两个 `-static` 的 `readelf -d` 无任何 `NEEDED` 条目。
           `android-arm64` **应该**有 `NEEDED [libc.so]` —— 那是 Bionic，不是构建失误：
@@ -452,6 +496,12 @@ jobs:
           ⚠️ **Termux 产物未在真机验证过。** CI 只能检查它是不是合法的 Android 二进制
           （解释器 `/system/bin/linker64`、链接 Bionic），**跑不了冒烟测试**。
           详见包内的 `README.md`。
+
+          Termux 上装客户端最省事的办法（`termux-agent.sh` 见仓库 `contrib/termux/`）：
+
+          ```
+          bash ~/termux-agent.sh client
+          ```
 
           ## 与官方包的差别
 

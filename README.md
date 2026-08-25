@@ -34,15 +34,36 @@ OpenWrt 只有 musl（`/lib/ld-musl-x86_64.so.1`），Android/Termux 只有 Bion
 | `teleport-<ver>-linux-amd64-static.tar.gz` | 静态 musl | x86_64 OpenWrt / 软路由 / 任意 x86_64 Linux |
 | `teleport-<ver>-linux-arm64-static.tar.gz` | 静态 musl | arm64 OpenWrt / 树莓派 / Termux 里的 proot-distro |
 | `teleport-<ver>-android-arm64.tar.gz` | **动态 Bionic** | Termux（原生，非 proot） |
+| `tsh-<ver>-linux-amd64-static.tar.gz` | 静态 musl | 同上，客户端 |
+| `tsh-<ver>-linux-arm64-static.tar.gz` | 静态 musl | 同上，客户端 |
+| `tsh-<ver>-android-arm64.tar.gz` | **动态 Bionic** | 同上，客户端 |
+
+`teleport` 是 agent（让别人连进来），`tsh` 是客户端（从这台机器连出去）。
+**一个工具一个包**：只要客户端的人不该被迫下 450MB 的 agent。
+不构建 `tctl` —— 管理端工具放在路由器/手机上没有实际用途。
 | `SHA256SUMS` | | 校验 |
 
 两个 `-static` 产物 `readelf -d` 没有任何 `NEEDED` 条目，不依赖目标系统的 libc。
 `android-arm64` 则**应该**有 `NEEDED [libc.so]`，那是 Bionic，不是构建失误。
 
-**只含 `teleport`（agent），不含 `tsh` / `tctl`。** 客户端工具请用官方包。
+**不含 `tctl`。** 它是管理端工具，放在非 glibc 的路由器/手机上没有实际用途。
 
-体积约 357MB —— 这是 Teleport 本身就有的大小，不是静态链接造成的
-（实测静态 musl 比官方 glibc 动态版只大 1.3MB，+0.35%）。
+`teleport` 体积约 357MB（解包后 450MB）—— 这是 Teleport 本身就有的大小，
+不是静态链接造成的（实测静态 musl 比官方 glibc 动态版只大 1.3MB，+0.35%）。
+`tsh` 小得多。
+
+### 为什么 `tsh` 不需要额外补丁
+
+`tsh` 在 `GOOS=android` 下的 cgo 依赖面是 `teleport` 的**真子集**：
+
+```
+teleport : runtime/cgo  net  session/shell  plugin  go-sqlite3  pkcs11  crypto11  lib/system
+tsh      : runtime/cgo  net  session/shell  plugin
+```
+
+它**不碰任何被补丁改过的包**（`lib/inventory/metadata`、`session/host/user`、
+`session/uacc` 都不在它的依赖图里）。所以"`tsh` 能编过"是"`teleport` 能编过"的推论，
+不是新的赌注。补丁照打，只是对它不产生任何影响。
 
 ## 构建方式
 
@@ -54,6 +75,7 @@ Actions → `build` → Run workflow。
 | `publish` | true | 编译成功后发 Release |
 | `force` | false | 同名 Release 已存在时删掉重发 |
 | `include_termux` | true | 同时构建 Termux 目标。Termux 目标较新，出问题时可关掉它单独发静态版 |
+| `include_tsh` | true | 同时构建客户端 `tsh`（每个目标各一份）。关掉则只发 agent |
 
 两个架构分别在**各自的原生 runner** 上用原生 `musl-gcc` 编译
 （amd64 用 `ubuntu-latest`，arm64 用 GitHub 的免费 arm64 runner `ubuntu-24.04-arm`，
@@ -167,6 +189,8 @@ bash ~/termux-agent.sh ssh
 `ssh` 子命令把 sshd 支起来（8022），之后从电脑上一条命令收尾：
 
 ```sh
+bash ~/termux-agent.sh client      # 只装客户端 tsh
+# 或
 bash ~/termux-agent.sh all --proxy teleport.example.com:443 --token <node token>
 ```
 
