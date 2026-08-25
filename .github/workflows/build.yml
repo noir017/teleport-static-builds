@@ -1,6 +1,12 @@
-# 拉上游 Teleport 源码 → 打 musl 补丁 → 编译成完全静态的二进制 → 发 Release。
+# 拉上游 Teleport 源码 → 打补丁 → 为非 glibc 平台编译 → 发 Release。
 #
 # 本仓库不存放上游源码, 每次运行时按 tag 现拉。
+#
+# 三个产物, 分两类:
+#   linux-amd64-static / linux-arm64-static  静态 musl, 不依赖目标系统 libc
+#   android-arm64                            动态链接 Bionic (Termux)
+# 后者刻意不是静态的 —— 原因见 build_termux job 顶部的注释, 一句话是
+# Android 既没有 /etc/passwd 也没有 /etc/resolv.conf, 必须靠 Bionic 兜底。
 #
 # ── 为什么官方二进制在 OpenWrt / Termux 上跑不了 ──
 # 官方 Linux 包是 CGO 动态链接 glibc 的(ldd 可见 libc.so.6 / libresolv.so.2 /
@@ -15,11 +21,13 @@
 #
 # ── 所以: 保留 CGO=1 换 musl-gcc, 只改一个包 ──
 # 上面 5 个包里除 metadata 外用的是 <signal.h>/<utmp.h>/<pwd.h>, musl 全都提供,
-# 一行不用改就编过。详见 scripts/apply-musl-patch.sh。
+# 一行不用改就编过。详见 scripts/apply-nonglibc-patch.sh。
 #
 # ── 架构 ──
-# 两个架构都在**各自的原生 runner** 上用原生 musl-gcc 编译, 不做交叉编译、
+# 两个 **静态** 目标都在各自的原生 runner 上用原生 musl-gcc 编译, 不做交叉编译、
 # 不需要 zig。arm64 用 GitHub 的免费 arm64 runner(仅 public 仓库)。
+# Termux 目标是例外: NDK 的预构建工具链只有 linux-x86_64 一份, 只能在 x86_64
+# runner 上交叉编译到 android/arm64。
 
 name: build
 
@@ -38,6 +46,10 @@ on:
         description: '同名 Release 已存在时覆盖重发'
         type: boolean
         default: false
+      include_termux:
+        description: '同时构建 Termux(Android/Bionic) 目标'
+        type: boolean
+        default: true
 
   # 想每周自动跟进上游就取消下面两行的注释。
   # 默认关着: 定时任务会在无人看管时对外发布 Release, 那应该是一个明确的选择,
@@ -149,8 +161,8 @@ jobs:
           echo "commit = $(git -C src rev-parse HEAD)"
           echo "go.mod = $(grep -m1 '^go ' src/go.mod)"
 
-      - name: 打 musl 补丁
-        run: bash scripts/apply-musl-patch.sh src
+      - name: 打非 glibc 补丁
+        run: bash scripts/apply-nonglibc-patch.sh src
 
       - name: 安装 musl 工具链
         run: |
@@ -229,14 +241,168 @@ jobs:
           retention-days: 7
 
   # ───────────────────────────────────────────────────────────
-  # 两个架构都成功才发 Release(缺架构的 Release 比没有更坑人)
+  # Termux (Android) —— 与上面的静态构建是两种不同的东西
+  #
+  # ⚠️ 这个产物**不是静态的**, 是刻意的。Android 上必须链接 Bionic:
+  #   1. Android 没有 /etc/passwd。静态 musl 的 getpwnam/getpwuid 只会读那个
+  #      文件, 返回 NULL; 而 Bionic 会为 Android 的 uid **合成** passwd 条目。
+  #      Teleport 的 ssh_service 要解析登录用户的 shell 和 home, 拿不到就没法开会话。
+  #   2. Android 没有 /etc/resolv.conf。DNS 要经由 Bionic 的 resolver 走 netd,
+  #      静态二进制根本无从解析域名。
+  # 所以这里是 GOOS=android + NDK clang, 动态链接 /system/lib64 里的 Bionic。
+  #
+  # 注意 NDK 的预构建工具链只有 linux-x86_64 一份, 所以本 job 必须跑在 x86_64
+  # runner 上交叉编译到 arm64 —— 不能像上面那样用原生 arm64 runner。
   # ───────────────────────────────────────────────────────────
-  release:
-    needs: [resolve, build]
-    # 定时触发时 inputs 是空的, 若写成 `&& inputs.publish` 会永远为假 ——
-    # 那会让启用 schedule 的人得到"构建成功但永远不发版"的哑故障。
+  build_termux:
+    needs: resolve
     if: >-
       needs.resolve.outputs.skip != 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.include_termux)
+    runs-on: ubuntu-latest      # 必须 x86_64: NDK 工具链只有 linux-x86_64
+    timeout-minutes: 90
+    env:
+      REF: ${{ needs.resolve.outputs.ref }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      ARCH: arm64
+    steps:
+      - name: 检出本仓库(补丁与脚本)
+        uses: actions/checkout@v4
+
+      - name: 拉取上游源码
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$REF" "$UPSTREAM" src
+          echo "commit = $(git -C src rev-parse HEAD)"
+
+      - name: 打非 glibc 补丁
+        run: bash scripts/apply-nonglibc-patch.sh src
+
+      - name: 定位 Android NDK
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            echo "::error::runner 上找不到 Android NDK。相关环境变量:"
+            env | grep -i -E 'ndk|android' || true
+            exit 1
+          fi
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ ! -d "$TC" ]; then
+            echo "::error::NDK 里没有 linux-x86_64 预构建工具链: $TC"
+            ls "$NDK/toolchains/llvm/prebuilt" 2>/dev/null || true
+            exit 1
+          fi
+          # 选 API level: 优先 24(Termux 支持 Android 7+), 否则取可用的最低值
+          avail="$(ls "$TC" | sed -n 's/^aarch64-linux-android\([0-9]\+\)-clang$/\1/p' | sort -n)"
+          [ -n "$avail" ] || { echo "::error::NDK 里没有 aarch64-linux-android*-clang"; ls "$TC" | head -20; exit 1; }
+          echo "可用 API level: $(echo $avail | tr '\n' ' ')"
+          API="$(echo "$avail" | grep -x 24 || echo "$avail" | head -1)"
+          CC="$TC/aarch64-linux-android${API}-clang"
+          echo "NDK      = $NDK"
+          echo "API      = $API"
+          echo "CC       = $CC"
+          "$CC" --version | head -1
+          echo "CC=$CC" >> "$GITHUB_ENV"
+          echo "NDK_API=$API" >> "$GITHUB_ENV"
+
+      - name: 安装 Go(版本取自上游 go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - name: 确认 android 下选中了非 glibc 变体
+        working-directory: src
+        env:
+          GOOS: android
+          GOARCH: arm64
+          CGO_ENABLED: '1'
+        run: |
+          set -euo pipefail
+          # 刻意**不传** -tags musl: android 上 `|| android` 那半边约束就该自己生效。
+          # 这一步同时是对该约束的实测。
+          go list -f 'metadata => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./lib/inventory/metadata
+          if go list -f '{{.CgoFiles}}' ./lib/inventory/metadata | grep -q glibc; then
+            echo "::error::android 下仍选中 glibc 变体 —— Bionic 没有 gnu/libc-version.h, 必然失败"
+            exit 1
+          fi
+
+      - name: 编译
+        working-directory: src
+        env:
+          GOOS: android
+          GOARCH: arm64
+          CGO_ENABLED: '1'
+        run: |
+          set -euo pipefail
+          # 不加 -extldflags -static: 见本 job 顶部注释, Android 上必须动态链接 Bionic
+          go build -v -trimpath \
+            -ldflags="-s -w -X github.com/gravitational/teleport.Gitref=$REF" \
+            -o ../teleport ./tool/teleport
+
+      - name: 验证产物是 Android 二进制
+        run: |
+          set -euo pipefail
+          file teleport
+          # 决定性判据: 解释器必须是 Android 的 linker64
+          interp="$(readelf -l teleport | sed -n 's/.*interpreter: \(.*\)\]/\1/p')"
+          echo "interpreter = ${interp:-<none>}"
+          case "$interp" in
+            /system/bin/linker64) : ;;
+            *) echo "::error::解释器是 '${interp:-<none>}', 期望 /system/bin/linker64"; exit 1 ;;
+          esac
+          echo "--- NEEDED ---"
+          readelf -d teleport | grep NEEDED || true
+          # Bionic 的 libc 就叫 libc.so; 出现 libc.so.6 说明误链到了 glibc
+          readelf -d teleport | grep -q 'NEEDED.*\[libc\.so\]' \
+            || { echo "::error::没有链接 Bionic 的 libc.so"; exit 1; }
+          if readelf -d teleport | grep -qE '\[libc\.so\.6\]|\[ld-linux'; then
+            echo "::error::链到了 glibc, 这在 Android 上跑不了"; exit 1
+          fi
+          echo "确认: Android arm64 动态可执行文件"
+          # ⚠️ runner 是 Linux/x86_64, 跑不了这个二进制 ——
+          #    与静态构建不同, 本 job **没有** 冒烟测试, 真机验证是必需的。
+          echo "::notice::Android 二进制无法在 runner 上执行, 未做冒烟测试"
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          NAME="teleport-${VERSION}-android-arm64"
+          mkdir -p "dist/$NAME"
+          cp teleport "dist/$NAME/"
+          cp contrib/termux/README.md "dist/$NAME/" 2>/dev/null || true
+          tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
+          rm -rf "dist/$NAME"
+          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          sha256sum teleport | awk -v n="$NAME" '{print $1"  "n"/teleport"}' \
+            >> "dist/${NAME}.tar.gz.sha256"
+          ls -la dist
+          cat "dist/${NAME}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-android-arm64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────
+  # 所有目标都成功才发 Release(缺目标的 Release 比没有更坑人)
+  # ───────────────────────────────────────────────────────────
+  release:
+    needs: [resolve, build, build_termux]
+    # 两个容易踩的坑, 都记在这里:
+    #  1. 定时触发时 inputs 是空的, 写成 `&& inputs.publish` 会永远为假 ——
+    #     那会让启用 schedule 的人得到"构建成功但永远不发版"的哑故障。
+    #  2. **被跳过的依赖会连带跳过下游**。include_termux=false 时 build_termux
+    #     是 skipped, 若不加 !cancelled() + 显式判定 result, release 也会被跳过,
+    #     那个开关就等于没有。
+    if: >-
+      !cancelled() &&
+      needs.resolve.outputs.skip != 'true' &&
+      needs.build.result == 'success' &&
+      (needs.build_termux.result == 'success' || needs.build_termux.result == 'skipped') &&
       (github.event_name != 'workflow_dispatch' || inputs.publish)
     runs-on: ubuntu-latest
     env:
@@ -263,17 +429,33 @@ jobs:
           # 用 quoted heredoc + 占位符: 正文里有大量反引号和 $, 让 shell 去展开
           # 只会自找麻烦(反引号会变成命令替换)。
           cat > notes.md <<'EOF'
-          上游 [`@REF@`](https://github.com/gravitational/teleport/releases/tag/@REF@) 的**完全静态**构建，
-          用于官方包跑不了的平台（OpenWrt/musl、Termux/Bionic 等）。
+          上游 [`@REF@`](https://github.com/gravitational/teleport/releases/tag/@REF@) 的构建，
+          用于官方包跑不了的平台（OpenWrt/musl、Termux/Bionic）。
 
           只含 `teleport`（agent），不含 `tsh` / `tctl`。
 
+          ## 产物
+
+          | 文件 | 链接方式 | 平台 |
+          |---|---|---|
+          | `teleport-@VERSION@-linux-amd64-static.tar.gz` | 静态 musl | x86_64 OpenWrt / 软路由 |
+          | `teleport-@VERSION@-linux-arm64-static.tar.gz` | 静态 musl | arm64 OpenWrt / 树莓派 / proot-distro |
+          | `teleport-@VERSION@-android-arm64.tar.gz` | **动态 Bionic** | Termux（原生） |
+
+          两个 `-static` 的 `readelf -d` 无任何 `NEEDED` 条目。
+          `android-arm64` **应该**有 `NEEDED [libc.so]` —— 那是 Bionic，不是构建失误：
+          Android 既没有 `/etc/passwd`（用户解析）也没有 `/etc/resolv.conf`（DNS），
+          必须靠 Bionic 兜底。
+
+          ⚠️ **Termux 产物未在真机验证过。** CI 只能检查它是不是合法的 Android 二进制
+          （解释器 `/system/bin/linker64`、链接 Bionic），**跑不了冒烟测试**。
+          详见包内的 `README.md`。
+
           ## 与官方包的差别
 
-          - 静态链接，`readelf -d` 无 `NEEDED` 条目，不依赖目标系统的 libc
-          - `lib/inventory/metadata` 的 glibc 版本探测在 musl 下返回空串
-            （musl 不导出运行时版本查询接口），其余源码与上游一致
-          - 体积与官方包基本相同（静态链接只多约 1.3MB）
+          - `lib/inventory/metadata` 的 glibc 版本探测在 musl / Bionic 下返回空串
+            （两者都不导出运行时版本查询接口），其余源码与上游一致
+          - 静态版体积与官方包基本相同（静态链接只多约 1.3MB）
 
           ## 校验
 

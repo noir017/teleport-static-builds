@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 把上游 Teleport 源码改成能用 musl 工具链构建。
+# 把上游 Teleport 源码改成能给非 glibc 目标构建(musl / Android Bionic)。
 #
 # 上游唯一真正 glibc 专有的地方是 lib/inventory/metadata/metadata_linux.go 里的
 #   // #include <gnu/libc-version.h>
@@ -9,15 +9,21 @@
 # 这个头文件 glibc 独有，任何 musl 工具链都变不出来。
 #
 # 本脚本把它拆成两个带 build tag 的文件：
-#   metadata_linux_glibc.go  (linux && !musl)  ← 原 cgo 实现，一字不改
-#   metadata_linux_musl.go   (linux && musl)   ← 纯 Go 空实现
-# 不带 -tags musl 构建时行为与上游完全一致。
+#   metadata_linux_glibc.go     (linux && !musl && !android)  ← 原 cgo 实现，一字不改
+#   metadata_linux_nonglibc.go  ((linux && musl) || android)  ← 纯 Go 空实现
+#
+# ⚠️ GOOS=android **同时满足 linux build tag**。所以 glibc 变体必须显式
+#    `!android`，否则 Android 构建会去找 Bionic 根本没有的 gnu/libc-version.h。
+#    反过来 nonglibc 变体在 android 上**不需要传任何 tag** 就生效 —— 少传一个
+#    tag 不该变成一次编译失败。
+#
+# 普通 glibc Linux 构建(不带 -tags musl、非 android)行为与上游完全一致。
 #
 # 其余用到 cgo 的包（lib/system 的 <signal.h>、session/uacc 的 <utmp.h>、
 # session/shell 与 secretsscanner/authorizedkeys 的 <pwd.h>）musl 全都提供，
 # 一行都不用改 —— 所以这里刻意只动一个包。
 #
-# 用法: apply-musl-patch.sh <上游源码目录>
+# 用法: apply-nonglibc-patch.sh <上游源码目录>
 #
 # 设计取向: 宁可炸得响，也不要静默产出一个坏二进制。
 # 上游一旦改动那个文件的形状，下面的断言会立刻失败并打印实际内容。
@@ -28,13 +34,13 @@ SRC="${1:?用法: $0 <上游源码目录>}"
 PKG="$SRC/lib/inventory/metadata"
 F="$PKG/metadata_linux.go"
 
-die() { printf '\n[apply-musl-patch] 失败: %s\n' "$*" >&2; exit 1; }
-note() { printf '[apply-musl-patch] %s\n' "$*"; }
+die() { printf '\n[apply-nonglibc-patch] 失败: %s\n' "$*" >&2; exit 1; }
+note() { printf '[apply-nonglibc-patch] %s\n' "$*"; }
 
 [ -f "$F" ] || die "找不到 $F —— 上游可能挪走了这个包"
 
 # ── 幂等 ──
-if [ -f "$PKG/metadata_linux_musl.go" ]; then
+if [ -f "$PKG/metadata_linux_nonglibc.go" ]; then
   note "补丁已存在，跳过"
   exit 0
 fi
@@ -79,7 +85,7 @@ note "已从 metadata_linux.go 移除 cgo"
 
 # ── 2. glibc 变体: 原实现 ──
 cat > "$PKG/metadata_linux_glibc.go" <<'EOF'
-//go:build linux && !musl
+//go:build linux && !musl && !android
 
 /*
  * Teleport
@@ -112,8 +118,8 @@ func (c *fetchConfig) fetchGlibcVersion() string {
 EOF
 
 # ── 3. musl 变体: 纯 Go ──
-cat > "$PKG/metadata_linux_musl.go" <<'EOF'
-//go:build linux && musl
+cat > "$PKG/metadata_linux_nonglibc.go" <<'EOF'
+//go:build (linux && musl) || android
 
 /*
  * Teleport
@@ -135,17 +141,18 @@ cat > "$PKG/metadata_linux_musl.go" <<'EOF'
 
 package metadata
 
-// fetchGlibcVersion 在 musl 下没有对应实现。
+// fetchGlibcVersion 在非 glibc 的 libc 上没有对应实现。
 //
-// musl 不导出任何运行时版本查询接口 —— 它没有 gnu_get_libc_version, 也没有
-// 与之等价的符号。返回空串是如实上报"未知", 比编造一个版本号诚实:
-// 这个值只用于 inventory 展示, 上游对空串的处理是直接省略该字段。
+// musl 与 Android Bionic 都不导出运行时版本查询接口 —— 没有
+// gnu_get_libc_version, 也没有与之等价的符号。返回空串是如实上报"未知",
+// 比编造一个版本号诚实: 这个值只用于 inventory 展示,
+// 上游对空串的处理是直接省略该字段。
 func (c *fetchConfig) fetchGlibcVersion() string {
 	return ""
 }
 EOF
 
-note "已生成 metadata_linux_glibc.go / metadata_linux_musl.go"
+note "已生成 metadata_linux_glibc.go / metadata_linux_nonglibc.go"
 
 # ── 4. 交给 Go 自己确认结果可用 ──
 # gofmt 能抓出 awk 破坏语法、以及 //go:build 位置不对之类的问题
@@ -156,7 +163,7 @@ note "已生成 metadata_linux_glibc.go / metadata_linux_musl.go"
 if command -v gofmt >/dev/null 2>&1; then
   bad="$(gofmt -l "$PKG" || true)"
   if [ -n "$bad" ]; then
-    printf '\n[apply-musl-patch] gofmt 差异:\n' >&2
+    printf '\n[apply-nonglibc-patch] gofmt 差异:\n' >&2
     for f in $bad; do gofmt -d "$f" >&2 || true; done
     die "生成的文件不符合 gofmt: $bad"
   fi

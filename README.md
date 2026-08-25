@@ -1,9 +1,12 @@
 # teleport-static-builds
 
-给官方包跑不了的平台构建**完全静态链接**的 Teleport agent。
+给官方包跑不了的平台构建 Teleport agent。
 
 本仓库**不存放上游源码**，每次构建时按 tag 现拉 `gravitational/teleport`，
 打一个很小的补丁，然后编译、发 Release。
+
+产物分两类：Linux 目标是**完全静态**的（musl，不依赖目标系统 libc）；
+Termux 目标**刻意是动态**的（链接 Android Bionic）—— 原因见下面的 Termux 一节。
 
 ## 解决的是什么问题
 
@@ -22,17 +25,19 @@ $ file teleport
 OpenWrt 只有 musl（`/lib/ld-musl-x86_64.so.1`），Android/Termux 只有 Bionic，
 两者都没有 glibc，也默认不装 gcompat —— 官方包直接起不来。
 
-本仓库的产物 `readelf -d` 没有任何 `NEEDED` 条目，不依赖目标系统的 libc。
-
 ## 产物
 
-每个 Release 对应一个上游 tag，含两个架构：
+每个 Release 对应一个上游 tag：
 
-| 文件 | 平台 |
-|---|---|
-| `teleport-<ver>-linux-amd64-static.tar.gz` | x86_64 OpenWrt / 软路由 / 任意 x86_64 Linux |
-| `teleport-<ver>-linux-arm64-static.tar.gz` | arm64 OpenWrt / 树莓派 / **Termux（见下）** |
-| `SHA256SUMS` | 校验 |
+| 文件 | 链接方式 | 平台 |
+|---|---|---|
+| `teleport-<ver>-linux-amd64-static.tar.gz` | 静态 musl | x86_64 OpenWrt / 软路由 / 任意 x86_64 Linux |
+| `teleport-<ver>-linux-arm64-static.tar.gz` | 静态 musl | arm64 OpenWrt / 树莓派 / Termux 里的 proot-distro |
+| `teleport-<ver>-android-arm64.tar.gz` | **动态 Bionic** | Termux（原生，非 proot） |
+| `SHA256SUMS` | | 校验 |
+
+两个 `-static` 产物 `readelf -d` 没有任何 `NEEDED` 条目，不依赖目标系统的 libc。
+`android-arm64` 则**应该**有 `NEEDED [libc.so]`，那是 Bionic，不是构建失误。
 
 **只含 `teleport`（agent），不含 `tsh` / `tctl`。** 客户端工具请用官方包。
 
@@ -48,6 +53,7 @@ Actions → `build` → Run workflow。
 | `upstream_ref` | 空 | 上游 tag。留空则自动取最新正式版（忽略 rc/alpha） |
 | `publish` | true | 编译成功后发 Release |
 | `force` | false | 同名 Release 已存在时删掉重发 |
+| `include_termux` | true | 同时构建 Termux 目标。Termux 目标较新，出问题时可关掉它单独发静态版 |
 
 两个架构分别在**各自的原生 runner** 上用原生 `musl-gcc` 编译
 （amd64 用 `ubuntu-latest`，arm64 用 GitHub 的免费 arm64 runner `ubuntu-24.04-arm`，
@@ -61,14 +67,19 @@ Actions → `build` → Run workflow。
 上游唯一真正 glibc 专有的地方，是 `lib/inventory/metadata/metadata_linux.go` 里的
 `#include <gnu/libc-version.h>` —— 这个头文件 glibc 独有，任何 musl 工具链都变不出来。
 
-`scripts/apply-musl-patch.sh` 把它拆成两个带 build tag 的文件：
+`scripts/apply-nonglibc-patch.sh` 把它拆成两个带 build tag 的文件：
 
 | 文件 | build tag | 内容 |
 |---|---|---|
-| `metadata_linux_glibc.go` | `linux && !musl` | 原 cgo 实现，一字不改 |
-| `metadata_linux_musl.go` | `linux && musl` | 纯 Go，返回空串 |
+| `metadata_linux_glibc.go` | `linux && !musl && !android` | 原 cgo 实现，一字不改 |
+| `metadata_linux_nonglibc.go` | `(linux && musl) \|\| android` | 纯 Go，返回空串 |
 
-**不带 `-tags musl` 构建时行为与上游完全一致。**
+**普通 glibc Linux 构建（不带 `-tags musl`、非 android）行为与上游完全一致。**
+
+⚠️ `!android` 那半边是必需的：**Go 的 `GOOS=android` 同时满足 `linux` build tag**，
+不排除的话 Android 构建会去找 Bionic 根本没有的 `gnu/libc-version.h`。
+反过来 `|| android` 让 Android 上**不需要传任何 tag** 就选中正确的变体 ——
+少传一个 tag 不该变成一次编译失败。
 
 ### 为什么不直接 `CGO_ENABLED=0`
 
@@ -136,18 +147,44 @@ chmod 755 /etc/init.d/teleport
 357MB 从本地中继到路由器可能极慢。**让目标机自己从 GitHub 拉**（Release 是免鉴权的，
 直接 `curl` 即可）—— 实测比经由一条慢链路中继快一到两个数量级。
 
-## Termux（Android）—— 未实测
+## Termux（Android）
 
-arm64 产物**理论上**可以直接在 Termux 里跑：完全静态链接的二进制不碰目标系统的 libc，
-内核仍是 Linux，所以不需要为 Bionic 单独构建。
+**已构建，未在真机验证。** 完整说明见 [`contrib/termux/README.md`](contrib/termux/README.md)，
+那份也会一并打进 Termux 的 tarball。
 
-尚未验证的风险：
+### 为什么它不是静态的
 
-- Android 的 `exec` 限制（Termux 自己的 prefix 目录可执行，大概率没问题）
-- Teleport 要建 PTY、读 `/proc`，Android 的 SELinux 策略可能拦
-- Termux 没有 procd/systemd，自启要用 `termux-services` 或 `nohup`
+我最初以为 arm64 静态产物可以直接在 Termux 里跑 —— 静态二进制不碰目标系统的 libc，
+内核也还是 Linux。**这个判断是错的**，有两个硬性原因：
 
-试通了欢迎回来补一节。
+1. **Android 没有 `/etc/passwd`。** 静态 musl 的 `getpwnam` / `getpwuid` 只会读那个文件，
+   返回 NULL；Bionic 则会为 Android 的 uid **合成** passwd 条目。
+   Teleport 的 `ssh_service` 要解析登录用户的 shell 和 home，拿不到就开不了会话。
+2. **Android 没有 `/etc/resolv.conf`。** DNS 要经 Bionic 的 resolver 走 netd，
+   静态二进制无从解析域名 —— 连代理都连不上。
+
+所以 Termux 目标是 `GOOS=android` + NDK clang，动态链接 `/system/lib64` 里的 Bionic。
+
+### 构建上的两个约束
+
+- **必须在 x86_64 runner 上交叉编译。** NDK 的预构建工具链只有 `linux-x86_64` 一份，
+  所以这个 job 不能像静态目标那样用原生 arm64 runner。
+- **runner 上跑不了冒烟测试。** 静态目标能在同架构 runner 上直接 `./teleport version`，
+  Android 二进制不行。CI 只能验证「解释器是 `/system/bin/linker64`、链接的是 Bionic 的
+  `libc.so`、没有误链 glibc」。**真机验证是必需的，CI 绿灯不等于能跑。**
+
+### 已知风险（未实测）
+
+- Android 的 `exec` 限制（Termux prefix 可执行；`/sdcard` 带 `noexec` 必然失败）
+- SELinux 对 `/proc` 的 `hidepid` 限制，以及 `untrusted_app` 域可能拦 PTY 相关操作
+- Android 杀后台：需要 `termux-wake-lock` **加上**关闭电池优化，缺一不可
+- 能登录的账号只有 Termux 自己那个（Bionic 合成的 `u0_aNNN`），没有 root，无法切用户
+
+### 想省事就用 proot-distro
+
+在 Termux 里跑 Linux rootfs，然后用 **`linux-arm64-static`** 那个产物 —— rootfs 里
+`/etc/passwd` 和 `/etc/resolv.conf` 都齐，上面这些坑一个都不用踩。
+代价是 proot 的 ptrace 模拟有 syscall 开销。
 
 ## 许可
 
