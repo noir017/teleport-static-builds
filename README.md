@@ -149,8 +149,8 @@ chmod 755 /etc/init.d/teleport
 
 ## Termux（Android）
 
-**已构建，未在真机验证。** 完整说明见 [`contrib/termux/README.md`](contrib/termux/README.md)，
-那份也会一并打进 Termux 的 tarball。
+**已在 redroid (Android 13 / arm64) 容器里实测启动成功，未在真机 Termux 里验证。**
+完整说明见 [`contrib/termux/README.md`](contrib/termux/README.md)，那份也会一并打进 Termux 的 tarball。
 
 ### 为什么它不是静态的
 
@@ -204,10 +204,26 @@ android 那两个包的改动**不会影响**已经跑通的静态构建。
 
 **这只影响 Termux 目标。** 静态构建（musl）不碰这两个包，任何版本都不受影响。
 
-### 已知风险（未实测）
+### 容器实测结果（redroid, Android 13 / arm64-v8a / SDK 33）
 
+CI 之外做过一轮真实执行，`adb push` 到 `/data/local/tmp` 后：
+
+- `./teleport version` 退出码 0；`NEEDED = liblog.so libdl.so libc.so`，无任何 glibc 依赖。
+- `teleport start` 指向假 proxy，一路走到 `/webapi/find returned HTTP 404` ——
+  data_dir 创建、host UUID 生成、**DNS 解析**、TLS 握手、ALPN upgrade 全部正常。
+- **SQLite 后端运行正常**（`[SQLITE] Connected to database ... proc/sqlite.db`）。
+  go-sqlite3 的 C amalgamation 在 NDK 下能编也能跑，这是之前唯一没法预先验证的未知项。
+- 启动时打一行 `Disabling host user creation as this feature is only available on Linux`，
+  正是上面那张妥协表第一行的预期表现 —— **是降级，不是崩溃**。
+
+### 已知风险（redroid 覆盖不到）
+
+- **SELinux**：redroid 里 `getenforce` 是 **Disabled**，真机是 Enforcing。
+  `untrusted_app` 域对 PTY 分配、`/proc`(hidepid) 的限制完全没测到。
+- **运行身份不同**：`adb shell` 是 uid 2000（`shell` 域），比 Termux 的 `u0_aNNN`
+  （`untrusted_app` 域）权限高。app 沙箱内、从 `$PREFIX` 执行的行为没覆盖。
+- **真实 SSH 会话**：没接入真集群，PTY 分配和会话录制都没测过。
 - Android 的 `exec` 限制（Termux prefix 可执行；`/sdcard` 带 `noexec` 必然失败）
-- SELinux 对 `/proc` 的 `hidepid` 限制，以及 `untrusted_app` 域可能拦 PTY 相关操作
 - Android 杀后台：需要 `termux-wake-lock` **加上**关闭电池优化，缺一不可
 - 能登录的账号只有 Termux 自己那个（Bionic 合成的 `u0_aNNN`），没有 root，无法切用户
 

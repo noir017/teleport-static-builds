@@ -1,6 +1,7 @@
 # Termux 上运行 Teleport agent
 
-**状态：已构建，未在真机验证。** 下面的风险一节请先读完。
+**状态：已在 redroid (Android 13 / arm64) 容器里实测启动成功，但未在真机 Termux 里验证。**
+两者的差距不小，下面的风险一节请先读完。
 
 ## 这个产物和另外两个不一样
 
@@ -112,15 +113,39 @@ termux-wake-lock          # 持有 wake lock
 以及在系统设置里把 Termux 的电池优化关掉（各家 ROM 位置不同，
 国产 ROM 通常还要额外加"自启动"白名单）。这一条不做，agent 迟早离线。
 
-## 已知风险（未实测）
+## 已实测（redroid，Android 13 / arm64-v8a / SDK 33）
+
+用 `adb push` 到 `/data/local/tmp` 后：
+
+- `./teleport version` 正常返回，退出码 0。
+- `readelf` 层面确认 `NEEDED = liblog.so libdl.so libc.so`、interpreter `/system/bin/linker64`，
+  没有任何 glibc 依赖。
+- `teleport start` 指向一个假 proxy，一路走到 `/webapi/find returned HTTP 404` ——
+  说明 **data_dir 创建、host UUID 生成、DNS 解析、TLS 握手、ALPN upgrade 全部正常**。
+  DNS 能通尤其关键，它证明 Bionic resolver 那条路是活的。
+- **SQLite 后端运行正常**（`[SQLITE] Connected to database ... proc/sqlite.db`，pragma 读回成功）。
+  go-sqlite3 的 C amalgamation 在 NDK 下能编也能跑。
+- 启动时会打一行 `Disabling host user creation as this feature is only available on Linux`，
+  这正是上面那张表的第一行的预期表现 —— **是降级，不是崩溃**。
+
+## redroid 覆盖不到的三件事
+
+这三条仍然是未知数，别把上面的"实测通过"当成真机结论：
+
+1. **SELinux**：redroid 里 `getenforce` 是 **Disabled**。真机是 Enforcing，
+   `untrusted_app` 域对 PTY 分配、`/proc`(hidepid) 的限制完全没被测到。
+2. **运行身份不同**：`adb shell` 是 uid 2000（`shell` 域），**比 Termux 的 `u0_aNNN`
+   （`untrusted_app` 域）权限高**。从 `$PREFIX` 执行、app 沙箱内的行为没覆盖。
+3. **真实 SSH 会话**：没接入真集群，PTY 分配、会话录制、`ssh_service` 端到端都没测过。
+   接进集群后第一件事就是开一个会话试试。
+
+## 其余已知风险
 
 - **exec 限制**：Termux 的 prefix 目录可执行，理论上没问题；但从 `/sdcard`
   之类的位置执行必然失败（那些挂载点带 `noexec`）。
-- **SELinux**：Teleport 要建 PTY、读 `/proc`。Android 对 `/proc` 有
-  `hidepid` 类限制，`untrusted_app` 域也可能拦某些操作。
 - **utmp**：Bionic 的 utmp 是空桩，`session/uacc` 的会话记录会静默落空。
   Android 上本来就没有 utmp 消费方，预计无实际影响。
-- **体积**：二进制约 357MB。Android 内部存储紧张的设备要留意。
+- **体积**：解包后约 450MB。Android 内部存储紧张的设备要留意。
 - **Termux 版本**：必须用 F-Droid 或 GitHub 的官方版。
   Google Play 上那个旧版 Termux 已停止维护，targetSdk 更高，exec 行为不同。
 
