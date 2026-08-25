@@ -189,6 +189,21 @@ Bionic 比 musl 缺得多。除了 `metadata`，还有两个包必须走上游�
 补丁脚本按目标区分（`apply-nonglibc-patch.sh src musl|android`），
 android 那两个包的改动**不会影响**已经跑通的静态构建。
 
+### 上游挪过位置，两种布局都支持
+
+系统用户枚举的实现在 v18.10.x 中途被重构过，补丁脚本按实际存在的文件自动选路：
+
+| 上游版本 | 位置 |
+|---|---|
+| ≥ v18.10.7 | `session/host/user/user_linux_cgo.go` |
+| ≤ v18.10.0 | `lib/secretsscanner/authorizedkeys/users_list_linux.go` |
+
+两边都有 `_other.go` 兜底，改法同构。两种布局都实测过。
+再往前的版本（v17 及更早）没试过 —— 遇到未知布局脚本会带着两条路径名报错退出，
+不会静默产出坏二进制。
+
+**这只影响 Termux 目标。** 静态构建（musl）不碰这两个包，任何版本都不受影响。
+
 ### 已知风险（未实测）
 
 - Android 的 `exec` 限制（Termux prefix 可执行；`/sdcard` 带 `noexec` 必然失败）

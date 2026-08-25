@@ -213,22 +213,38 @@ fi
 #   user_other.go    GetHostUsers 的兜底实现
 # ══════════════════════════════════════════════════════════════
 if [ "$TARGET" = android ]; then
-  UPKG="$SRC/session/host/user"
-  if [ -d "$UPKG" ]; then
-    note "[host/user] 让 android 走非 cgo 路径"
-    retag "$UPKG/user_linux_cgo.go" \
+  # 上游在 v18.10.x 中途把系统用户枚举挪了位置, 两种布局都要支持:
+  #   新(≥18.10.7): session/host/user/                  user_linux_cgo.go
+  #   旧(≤18.10.0): lib/secretsscanner/authorizedkeys/  users_list_linux.go
+  # 两边都留了 _other.go 兜底, 改法同构。
+  UPKG_NEW="$SRC/session/host/user"
+  UPKG_OLD="$SRC/lib/secretsscanner/authorizedkeys"
+
+  if [ -f "$UPKG_NEW/user_linux_cgo.go" ]; then
+    note "[host/user] 新布局(session/host/user), 让 android 走非 cgo 路径"
+    retag "$UPKG_NEW/user_linux_cgo.go" \
           '//go:build linux && cgo' \
           '//go:build linux && cgo && !android'
-    retag "$UPKG/user_forward.go" \
+    retag "$UPKG_NEW/user_forward.go" \
           '//go:build !linux || !cgo' \
           '//go:build !linux || !cgo || android'
-    retag "$UPKG/user_other.go" \
+    retag "$UPKG_NEW/user_other.go" \
           '//go:build !darwin && !linux' \
           '//go:build (!darwin && !linux) || android'
+
+  elif [ -f "$UPKG_OLD/users_list_linux.go" ]; then
+    note "[authorizedkeys] 旧布局(lib/secretsscanner/authorizedkeys), 让 android 走兜底"
+    # ⚠️ users_list_linux.go 与新布局不同: 它**没有** //go:build,
+    #    只靠 _linux.go 文件名后缀约束, 所以是插入而非改写。
+    addtag "$UPKG_OLD/users_list_linux.go" '//go:build !android'
+    retag  "$UPKG_OLD/users_list_other.go" \
+           '//go:build !darwin && !linux' \
+           '//go:build (!darwin && !linux) || android'
+
   else
-    die "找不到 $UPKG。
-        v18.10.7 起系统用户枚举在这个包里(更早的版本在
-        lib/secretsscanner/authorizedkeys/users_list_linux.go)。
+    die "两种已知布局都找不到系统用户枚举的实现:
+        新: $UPKG_NEW/user_linux_cgo.go        (v18.10.7 及以后)
+        旧: $UPKG_OLD/users_list_linux.go      (v18.10.0 及以前)
         上游又挪动了位置, 需要人工确认 android 该排除哪些文件。"
   fi
 
