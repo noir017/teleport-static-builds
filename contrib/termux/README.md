@@ -37,18 +37,86 @@ Bionic 比 musl 缺得多，有两个包必须走上游的兜底实现。这不�
 所以 Termux 上的 Teleport 是一个**只能以 Termux 自身账号登录的 SSH 节点**，
 不能做用户provisioning。对"把手机接进集群"这个用途来说够用。
 
-## 安装
+## 一条龙脚本（推荐）
+
+同目录的 [`termux-agent.sh`](termux-agent.sh) 把下面所有手动步骤都包了，
+从干净的 Termux 开始只需要两步。
+
+### 第 1 步：在手机上敲这一次
+
+干净的 Termux 连 `curl` 都没有，所以这一步躲不掉要用手机键盘：
 
 ```sh
-pkg install curl tar
+pkg install -y curl && \
+curl -fsSL -o ~/termux-agent.sh \
+  https://raw.githubusercontent.com/noir017/teleport-static-builds/main/contrib/termux/termux-agent.sh && \
+bash ~/termux-agent.sh ssh
+```
+
+`ssh` 子命令装好 sshd（监听 **8022**）并打印出连接命令。
+把电脑的公钥当参数传进去就走密钥登录，不传则让你设密码：
+
+```sh
+bash ~/termux-agent.sh ssh "$(cat ~/.ssh/id_ed25519.pub)"   # 电脑上的公钥内容
+```
+
+### 第 2 步：从电脑 ssh 进去，剩下的一条命令
+
+```sh
+ssh u0_aNNN@<手机IP> -p 8022
+
+bash ~/termux-agent.sh all \
+  --proxy teleport.example.com:443 \
+  --token <tctl tokens add --type=node 给的 token>
+```
+
+`all` = `install` → `configure` → `verify` → `service` → `boot`。
+
+### 单步子命令
+
+| 子命令 | 做什么 |
+|---|---|
+| `ssh [公钥]` | 装 sshd、写 authorized_keys（幂等）、打印连接命令 |
+| `install` | 查架构/API/空间 → 下载 → **校验 sha256** → 解包 → `teleport version` |
+| `configure` | 生成 `~/.teleport/teleport.yaml` 和 600 权限的 token 文件 |
+| `verify` | 试启动 45 秒，判断到底是"没加入集群"还是"根本没起来" |
+| `service` | 写 runit service + 持 wake lock + 提示关电池优化 |
+| `boot` | 写 `~/.termux/boot/00-teleport`（需 Termux:Boot） |
+| `status` / `logs` / `uninstall` | 状态、跟日志、卸载 |
+
+环境变量也可以：`TELEPORT_VERSION` `TELEPORT_PROXY` `TELEPORT_TOKEN`
+`TELEPORT_NODENAME` `TERMUX_SSH_PUBKEY`。
+
+### 脚本刻意做的几件事
+
+- **校验两次哈希**：压缩包一次，解包后的二进制再一次。对不上直接中止，
+  不留半个坏文件在 `$PREFIX/opt`。
+- **`install` 的最后一步是真的执行 `teleport version`**。这是最关键的一道门，
+  不过就不往下走 —— 后面所有步骤都建立在"这台设备跑得动这个二进制"上。
+- **`verify` 会区分两种失败**：进程起来了但没加入集群（token 过期 / 代理地址错 /
+  控制面没发布 3024），和启动阶段就崩。这两种的排查方向完全不同。
+- **看到 `Disabling host user creation` 会明说这是正常的**，免得当 bug 查。
+- **不碰 `$PREFIX` 以外的东西**，`uninstall` 也不会替你删 token 和主机身份。
+
+下面是手动步骤，脚本做的就是这些。
+
+## 手动安装
+
+```sh
+pkg install -y curl tar
 
 mkdir -p "$PREFIX/opt/teleport" "$HOME/.teleport"
 cd "$PREFIX/opt/teleport"
 
-# 换成 Release 里的实际 URL
-curl -fSL -o t.tar.gz "https://github.com/noir017/teleport-static-builds/releases/download/vX.Y.Z/teleport-X.Y.Z-android-arm64.tar.gz"
+# 换成 Release 里的实际版本
+V=18.10.0
+B=https://github.com/noir017/teleport-static-builds/releases/download/v$V
+curl -fSL -o t.tar.gz "$B/teleport-$V-android-arm64.tar.gz"
+curl -fsSL -o SHA256SUMS "$B/SHA256SUMS"
+grep -F "  teleport-$V-android-arm64.tar.gz" SHA256SUMS | sha256sum -c -   # 必须 OK
+
 tar xzf t.tar.gz --strip-components=1
-chmod 755 teleport && rm t.tar.gz
+chmod 755 teleport && rm t.tar.gz SHA256SUMS
 
 ./teleport version        # 第一道验证: 能不能跑起来
 ```

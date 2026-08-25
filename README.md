@@ -152,6 +152,28 @@ chmod 755 /etc/init.d/teleport
 **已在 redroid (Android 13 / arm64) 容器里实测启动成功，未在真机 Termux 里验证。**
 完整说明见 [`contrib/termux/README.md`](contrib/termux/README.md)，那份也会一并打进 Termux 的 tarball。
 
+### 一条龙脚本
+
+[`contrib/termux/termux-agent.sh`](contrib/termux/termux-agent.sh) 覆盖从干净 Termux 到节点上线的全流程。
+干净环境下只有第一步要用手机键盘敲：
+
+```sh
+pkg install -y curl && \
+curl -fsSL -o ~/termux-agent.sh \
+  https://raw.githubusercontent.com/noir017/teleport-static-builds/main/contrib/termux/termux-agent.sh && \
+bash ~/termux-agent.sh ssh
+```
+
+`ssh` 子命令把 sshd 支起来（8022），之后从电脑上一条命令收尾：
+
+```sh
+bash ~/termux-agent.sh all --proxy teleport.example.com:443 --token <node token>
+```
+
+`all` = install（含 sha256 双重校验 + `teleport version` 执行门）→ configure → verify（45 秒试启动，
+区分「没加入集群」和「根本没起来」）→ service（runit + wake lock）→ boot（Termux:Boot）。
+单步子命令和环境变量见 `contrib/termux/README.md`。
+
 ### 为什么它不是静态的
 
 我最初以为 arm64 静态产物可以直接在 Termux 里跑 —— 静态二进制不碰目标系统的 libc，
