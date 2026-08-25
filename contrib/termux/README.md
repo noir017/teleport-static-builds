@@ -20,6 +20,22 @@ Termux 这份**刻意不是静态的**。Android 上必须链接 Bionic，有两
 
 所以 `readelf -d` 会看到 `NEEDED [libc.so]`，这是**正确的**，不是构建失误。
 
+## 为了能编过，Android 版做了两处功能性妥协
+
+Bionic 比 musl 缺得多，有两个包必须走上游的兜底实现。这不是构建细节，
+是你会实际撞到的行为差异：
+
+| 包 | Bionic 缺什么 | 后果 |
+|---|---|---|
+| `session/host/user` | `setpwent`/`getpwent`/`endpwent` | **主机用户自动创建（host_users）不可用**。Android 没有可枚举的 passwd 数据库 |
+| `session/uacc` | `updwtmp`/`getutline` | 会话不写 utmp/wtmp。Android 上本来就没有消费方，无实际影响 |
+
+注意 **单个用户的查询是正常的** —— Bionic 有 `getpwnam`/`getpwuid`，会为 Android
+的 uid 合成条目。不能做的只是"列出所有用户"，而那在 Android 上本来就没有意义。
+
+所以 Termux 上的 Teleport 是一个**只能以 Termux 自身账号登录的 SSH 节点**，
+不能做用户provisioning。对"把手机接进集群"这个用途来说够用。
+
 ## 安装
 
 ```sh

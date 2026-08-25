@@ -162,7 +162,7 @@ jobs:
           echo "go.mod = $(grep -m1 '^go ' src/go.mod)"
 
       - name: 打非 glibc 补丁
-        run: bash scripts/apply-nonglibc-patch.sh src
+        run: bash scripts/apply-nonglibc-patch.sh src musl
 
       - name: 安装 musl 工具链
         run: |
@@ -276,7 +276,9 @@ jobs:
           echo "commit = $(git -C src rev-parse HEAD)"
 
       - name: 打非 glibc 补丁
-        run: bash scripts/apply-nonglibc-patch.sh src
+        # android 目标比 musl 多改 2 个包: Bionic 没有 passwd 枚举 API
+        # (setpwent/getpwent/endpwent), 也没有 utmp 写入函数(updwtmp/getutline)
+        run: bash scripts/apply-nonglibc-patch.sh src android
 
       - name: 定位 Android NDK
         run: |

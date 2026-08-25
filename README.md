@@ -173,6 +173,22 @@ chmod 755 /etc/init.d/teleport
   Android 二进制不行。CI 只能验证「解释器是 `/system/bin/linker64`、链接的是 Bionic 的
   `libc.so`、没有误链 glibc」。**真机验证是必需的，CI 绿灯不等于能跑。**
 
+### Android 版的功能妥协
+
+Bionic 比 musl 缺得多。除了 `metadata`，还有两个包必须走上游的兜底实现：
+
+| 包 | Bionic 缺什么 | 后果 |
+|---|---|---|
+| `session/host/user` | `setpwent`/`getpwent`/`endpwent` | **host_users 自动创建不可用** |
+| `session/uacc` | `updwtmp`/`getutline` | 会话不写 utmp/wtmp（Android 上无消费方） |
+
+单个用户查询是正常的（Bionic 的 `getpwnam`/`getpwuid` 会为 Android uid 合成条目），
+不能做的只是"枚举所有用户"—— 那在 Android 上本来就没有意义。
+
+所以 Termux 目标的补丁面比 musl 大：musl 只改 1 个包，android 要改 3 个。
+补丁脚本按目标区分（`apply-nonglibc-patch.sh src musl|android`），
+android 那两个包的改动**不会影响**已经跑通的静态构建。
+
 ### 已知风险（未实测）
 
 - Android 的 `exec` 限制（Termux prefix 可执行；`/sdcard` 带 `noexec` 必然失败）
