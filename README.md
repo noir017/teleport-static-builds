@@ -221,19 +221,62 @@ bash ~/termux-agent.sh all --proxy teleport.example.com:443 --token <node token>
 
 ### Android 版的功能妥协
 
-Bionic 比 musl 缺得多。除了 `metadata`，还有两个包必须走上游的兜底实现：
+Bionic 比 musl 缺得多。除了 `metadata`，还有三个包需要 android 专用处理：
 
-| 包 | Bionic 缺什么 | 后果 |
-|---|---|---|
-| `session/host/user` | `setpwent`/`getpwent`/`endpwent` | **host_users 自动创建不可用** |
-| `session/uacc` | `updwtmp`/`getutline` | 会话不写 utmp/wtmp（Android 上无消费方） |
+| 包 | Bionic 的问题 | 处理 | 后果 |
+|---|---|---|---|
+| `session/host/user` | 没有 `setpwent`/`getpwent`/`endpwent` | 自带 cgo 实现，只让 `GetHostUsers` 走兜底 | **host_users 自动创建不可用**，其余查询正常 |
+| `session/uacc` | 没有 `updwtmp`/`getutline` | 走上游 `_other.go` | 会话不写 utmp/wtmp（Android 上无消费方） |
+| `session/shell` | `pw_shell` 恒为 `/bin/sh`，Termux 里不存在 | 改读 `$SHELL` / `$PREFIX/bin` | 无 |
 
-单个用户查询是正常的（Bionic 的 `getpwnam`/`getpwuid` 会为 Android uid 合成条目），
-不能做的只是"枚举所有用户"—— 那在 Android 上本来就没有意义。
+#### ⚠️ 曾经踩过的坑：不能把整个 `session/host/user` 让给上游的转发实现
 
-所以 Termux 目标的补丁面比 musl 大：musl 只改 1 个包，android 要改 3 个。
+最初为了绕开"不能枚举"，补丁把整个包让给了上游的 `user_forward.go`（转发给 `os/user`）。
+**那是错的，会让 `tsh ssh` 100% 失败：**
+
+```
+Failed to launch: user: Lookup not implemented on android
+ERROR: Process exited with status 255
+```
+
+原因是 **Go 标准库的 `os/user` 在 `GOOS=android` 下是硬编码的桩**：
+`lookup_android.go` 的约束是无条件的 `//go:build android`，四个 `Lookup*` 一律返回
+"not implemented"；而 cgo 实现 `cgo_lookup_unix.go` 的约束带 `&& !android`，
+**开着 cgo 也永远选不中**。等于为了解决"不能枚举"，把"单用户查询"一起赔了进去。
+
+现在的做法是自己写一个 `user_android.go`，直接 cgo 调 Bionic：
+
+| 函数 | Bionic 可用性 |
+|---|---|
+| `getpwnam_r` / `getpwuid_r` | 一直有，连 `__INTRODUCED_IN` 都没标 |
+| `getgrnam_r` / `getgrgid_r` | API 24+（本项目本来就按 24 编） |
+| `setpwent` / `getpwent` / `endpwent` | **没有** → 只有 `GetHostUsers` 走兜底 |
+
+Bionic 会为 Android 的 uid **合成** passwd 条目（`u0_aNNN`，uid 与 gid 同值），
+所以单用户查询本来就可用，只是标准库没去调它。
+
+#### 两处 Termux 特有的修正
+
+Bionic 合成的条目里有两个值在 Termux 里不能直接用，都按环境变量修正：
+
+- **`pw_dir` 恒为 `/data`** —— app 沙箱里不可写。改用 `$HOME`（缺失时用 `$PREFIX/../home`），
+  且**只对当前进程自己的 uid 生效** —— 拿 `$HOME` 去覆盖别人的 home 是错的。
+- **`pw_shell` 恒为 `/bin/sh`** —— Termux 没有 `/bin`。改用 `$SHELL`，
+  再退回 `$PREFIX/bin` 下的 `bash`/`zsh`/`fish`/`sh`。
+
+两处都在目录/文件真实存在时才覆盖，非 Termux 的 Android 环境不受影响。
+
+#### 补充组只能尽力而为
+
+Bionic 的 `getgrouplist` 是个 stub —— AOSP 注释原话是
+"All users are in just one group, the one passed in"，它不查任何数据库。
+所以 `GroupIds` 对**当前进程**用 `getgroups(2)` 拿内核里的真实补充组，
+对其他用户只能如实返回主组。Android 上没有别的用户可登录，这个限制不损失能力。
+
+所以 Termux 目标的补丁面比 musl 大：musl 只改 1 个包，android 要改 4 个。
 补丁脚本按目标区分（`apply-nonglibc-patch.sh src musl|android`），
-android 那两个包的改动**不会影响**已经跑通的静态构建。
+android 那几个包的改动**不会影响**已经跑通的静态构建 ——
+`go list` 实测确认 musl / glibc / darwin 三个目标选中的文件与打补丁前完全一致。
 
 ### 上游挪过位置，两种布局都支持
 
@@ -244,11 +287,16 @@ android 那两个包的改动**不会影响**已经跑通的静态构建。
 | ≥ v18.10.7 | `session/host/user/user_linux_cgo.go` |
 | ≤ v18.10.0 | `lib/secretsscanner/authorizedkeys/users_list_linux.go` |
 
-两边都有 `_other.go` 兜底，改法同构。两种布局都实测过。
+⚠️ **但 `tsh ssh` 的修复只在 ≥ v18.10.7 上成立。** 旧版没有 `session/host/user`
+这个抽象层，`session/reexec/reexec.go` 直接 `import "os/user"` 再调 `user.Lookup`，
+那是标准库的桩，**我们无处注入**。旧布局上补丁只保证"能编过、agent 能起来"，
+开 SSH 会话仍会撞上同一个错误。脚本会就此打印两行警告，不会假装修好了。
+**想在 Termux 上开会话，请构建 v18.10.7 或更新的版本。**
+
 再往前的版本（v17 及更早）没试过 —— 遇到未知布局脚本会带着两条路径名报错退出，
 不会静默产出坏二进制。
 
-**这只影响 Termux 目标。** 静态构建（musl）不碰这两个包，任何版本都不受影响。
+**这只影响 Termux 目标。** 静态构建（musl）不碰这些包，任何版本都不受影响。
 
 ### 容器实测结果（redroid, Android 13 / arm64-v8a / SDK 33）
 

@@ -33,19 +33,40 @@ Termux 这份**刻意不是静态的**。Android 上必须链接 Bionic，有两
 
 ## 为了能编过，Android 版做了两处功能性妥协
 
-Bionic 比 musl 缺得多，有两个包必须走上游的兜底实现。这不是构建细节，
+Bionic 比 musl 缺得多，有三个包需要 android 专用处理。这不是构建细节，
 是你会实际撞到的行为差异：
 
-| 包 | Bionic 缺什么 | 后果 |
+| 包 | Bionic 的问题 | 后果 |
 |---|---|---|
-| `session/host/user` | `setpwent`/`getpwent`/`endpwent` | **主机用户自动创建（host_users）不可用**。Android 没有可枚举的 passwd 数据库 |
-| `session/uacc` | `updwtmp`/`getutline` | 会话不写 utmp/wtmp。Android 上本来就没有消费方，无实际影响 |
+| `session/host/user` | 没有 `setpwent`/`getpwent`/`endpwent` | **主机用户自动创建（host_users）不可用**。Android 没有可枚举的 passwd 数据库 |
+| `session/uacc` | 没有 `updwtmp`/`getutline` | 会话不写 utmp/wtmp。Android 上本来就没有消费方，无实际影响 |
+| `session/shell` | `pw_shell` 恒为 `/bin/sh` | 已修正为读 `$SHELL` / `$PREFIX/bin`，无实际影响 |
 
-注意 **单个用户的查询是正常的** —— Bionic 有 `getpwnam`/`getpwuid`，会为 Android
+**单个用户的查询是正常的** —— Bionic 有 `getpwnam`/`getpwuid`，会为 Android
 的 uid 合成条目。不能做的只是"列出所有用户"，而那在 Android 上本来就没有意义。
 
 所以 Termux 上的 Teleport 是一个**只能以 Termux 自身账号登录的 SSH 节点**，
-不能做用户provisioning。对"把手机接进集群"这个用途来说够用。
+不能做用户 provisioning。对"把手机接进集群"这个用途来说够用。
+
+### ⚠️ 如果你用的是旧版产物，`tsh ssh` 会失败
+
+v18.10.7 之前的产物有一个已修复的 bug，表现是从别处 `tsh ssh` 连这台手机时：
+
+```
+Failed to launch: user: Lookup not implemented on android
+ERROR: Process exited with status 255
+```
+
+根因在 **Go 标准库**：`os/user` 在 `GOOS=android` 下是硬编码的桩，
+四个 `Lookup*` 一律返回 "not implemented"，且开着 cgo 也绕不过去。
+早期补丁为了绕开"不能枚举"，把整个用户查询包让给了转发实现，
+结果连单用户查询一起丢了。
+
+现在的产物自带 cgo 实现，直接调 Bionic 的 `getpwnam_r`/`getgrnam_r`，
+不再经过标准库那层桩。
+
+**这个修复只在上游 ≥ v18.10.7 上成立** —— 更早的上游版本没有可注入的抽象层，
+`reexec` 直接依赖标准库。用旧版上游构建的产物，agent 能起来，但开不了会话。
 
 ## 一条龙脚本（推荐）
 
