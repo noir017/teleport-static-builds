@@ -395,9 +395,31 @@ cmd_service() {
 
   mkdir -p "$SVC_DIR/log" "$LOG_DIR"
 
+  # $SHELL 可能指向一个已经卸载的 shell(换过 shell 又 pkg uninstall 的情况),
+  # 写进 service 前先确认它真的能执行, 否则挑一个装着的。
+  local svc_shell="${SHELL:-}"
+  if [ ! -x "$svc_shell" ]; then
+    svc_shell=""
+    for s in bash zsh fish sh; do
+      if [ -x "$PREFIX/bin/$s" ]; then svc_shell="$PREFIX/bin/$s"; break; fi
+    done
+    [ -n "$svc_shell" ] || die "在 $PREFIX/bin 下找不到任何 shell —— Termux 环境不完整"
+    warn "\$SHELL 不可用, service 里改用 $svc_shell"
+  fi
+
+  # ⚠️ runsvdir 给服务的环境是很干净的, 不能指望继承交互 shell 的变量。
+  # 但 agent 需要这三个:
+  #   HOME    Bionic 合成的 pw_dir 恒为 /data(沙箱里不可写), 要用它纠正
+  #   PREFIX  HOME 缺失时据此推出 home, 也用来找 shell
+  #   SHELL   Bionic 合成的 pw_shell 恒为 /bin/sh, Termux 里不存在
+  # 缺了它们会话仍能开, 但会落在 / 上、用兜底的 shell —— 体验差且难查。
+  # 所以这里写死成安装时的实际值, 不依赖运行时环境。
   cat > "$SVC_DIR/run" <<EOF
 #!$PREFIX/bin/sh
 exec 2>&1
+export HOME=$HOME
+export PREFIX=$PREFIX
+export SHELL=$svc_shell
 exec $BIN start --config=$CFG
 EOF
   cat > "$SVC_DIR/log/run" <<EOF

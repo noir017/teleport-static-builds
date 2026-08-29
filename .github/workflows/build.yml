@@ -203,6 +203,17 @@ jobs:
           if go list -tags musl -f '{{.CgoFiles}}' ./lib/inventory/metadata | grep -q glibc; then
             echo "::error::musl tag 没生效, 仍在编 glibc 变体"; exit 1
           fi
+          # android 目标的补丁给 session/host/user 和 session/shell 加了 !android
+          # 约束。musl 目标**不该**受影响 —— 这两行是防回归, 确保静态构建仍走
+          # 原来的 cgo 实现(musl 提供了 pwent 全家和 <pwd.h>, 一行都不用改)。
+          if [ -d ./session/host/user ]; then
+            go list -tags musl -f 'host/user => CgoFiles={{.CgoFiles}}' ./session/host/user
+            go list -tags musl -f '{{.CgoFiles}}' ./session/host/user | grep -q user_linux_cgo.go || {
+              echo "::error::musl 下没有选中 user_linux_cgo.go —— android 补丁误伤了静态构建"; exit 1; }
+          fi
+          go list -tags musl -f 'shell => CgoFiles={{.CgoFiles}}' ./session/shell
+          go list -tags musl -f '{{.CgoFiles}}' ./session/shell | grep -q shell_unix.go || {
+            echo "::error::musl 下没有选中 shell_unix.go —— android 补丁误伤了静态构建"; exit 1; }
 
       - name: 编译
         working-directory: src
@@ -322,11 +333,20 @@ jobs:
             ls "$NDK/toolchains/llvm/prebuilt" 2>/dev/null || true
             exit 1
           fi
-          # 选 API level: 优先 24(Termux 支持 Android 7+), 否则取可用的最低值
+          # 选 API level: 必须 >= 24。
+          # ⚠️ 这不再只是"Termux 支持 Android 7+"的偏好, 而是硬需求:
+          #    补丁生成的 session/host/user/user_android.go 用了
+          #    getgrnam_r / getgrgid_r, Bionic 从 API 24 才导出它们
+          #    (getpwnam_r / getpwuid_r 倒是一直有)。低于 24 会链接失败。
           avail="$(ls "$TC" | sed -n 's/^aarch64-linux-android\([0-9]\+\)-clang$/\1/p' | sort -n)"
           [ -n "$avail" ] || { echo "::error::NDK 里没有 aarch64-linux-android*-clang"; ls "$TC" | head -20; exit 1; }
           echo "可用 API level: $(echo $avail | tr '\n' ' ')"
-          API="$(echo "$avail" | grep -x 24 || echo "$avail" | head -1)"
+          API="$(echo "$avail" | grep -x 24 || echo "$avail" | awk '$1 >= 24' | head -1)"
+          if [ -z "$API" ]; then
+            echo "::error::NDK 里没有 >= 24 的 API level, 但 getgrnam_r/getgrgid_r 需要 24+"
+            echo "可用: $(echo $avail | tr '\n' ' ')"
+            exit 1
+          fi
           CC="$TC/aarch64-linux-android${API}-clang"
           echo "NDK      = $NDK"
           echo "API      = $API"
@@ -341,7 +361,7 @@ jobs:
           go-version-file: src/go.mod
           cache-dependency-path: src/go.sum
 
-      - name: 确认 android 下选中了非 glibc 变体
+      - name: 确认 android 下选中了正确的文件变体
         working-directory: src
         env:
           GOOS: android
@@ -354,6 +374,36 @@ jobs:
           go list -f 'metadata => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./lib/inventory/metadata
           if go list -f '{{.CgoFiles}}' ./lib/inventory/metadata | grep -q glibc; then
             echo "::error::android 下仍选中 glibc 变体 —— Bionic 没有 gnu/libc-version.h, 必然失败"
+            exit 1
+          fi
+
+          # ── 下面这两条是为了防止一个已经踩过的坑复发 ──
+          #
+          # 曾经把整个 session/host/user 让给上游的 user_forward.go(转发给
+          # os/user)。那会编译成功、CI 全绿, 然后在真机上 100% 失败:
+          #   Failed to launch: user: Lookup not implemented on android
+          # 因为 Go 标准库的 os/user 在 GOOS=android 下是硬编码的桩。
+          #
+          # 这是纯运行期故障, 上面那种"能不能编过"的检查抓不到,
+          # 所以必须在这里显式断言选中的是哪个文件。
+          if [ -d ./session/host/user ]; then
+            go list -f 'host/user => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./session/host/user
+            if ! go list -f '{{.CgoFiles}}' ./session/host/user | grep -q user_android.go; then
+              echo "::error::android 下没有选中 user_android.go —— 补丁没生效"
+              exit 1
+            fi
+            if go list -f '{{.GoFiles}}' ./session/host/user | grep -q user_forward.go; then
+              echo "::error::android 下选中了 user_forward.go —— 它转发给 os/user 的 android 桩, tsh ssh 必然失败"
+              exit 1
+            fi
+          else
+            echo "::warning::旧布局(无 session/host/user): SSH 会话在 android 上不可用, 见补丁脚本注释"
+          fi
+
+          # pw_shell 在 Bionic 上恒为 /bin/sh, Termux 里不存在 —— 必须走专用实现
+          go list -f 'shell => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./session/shell
+          if ! go list -f '{{.GoFiles}}' ./session/shell | grep -q shell_android.go; then
+            echo "::error::android 下没有选中 shell_android.go —— 会拿到 Bionic 合成的 /bin/sh"
             exit 1
           fi
 
