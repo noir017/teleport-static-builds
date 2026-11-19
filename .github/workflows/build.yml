@@ -60,6 +60,10 @@ on:
         description: '同时构建客户端 tsh(每个目标各一份)'
         type: boolean
         default: true
+      tools:
+        description: '覆盖要编的工具(空格分隔, 默认 teleport tsh; 例: tbot)'
+        required: false
+        default: ''
 
   # 想每周自动跟进上游就取消下面两行的注释。
   # 默认关着: 定时任务会在无人看管时对外发布 Release, 那应该是一个明确的选择,
@@ -147,7 +151,7 @@ jobs:
       ARCH: ${{ matrix.arch }}
       # 定时触发时 inputs 是空的 —— 直接写 `inputs.include_tsh` 会永远为假,
       # 和 release 那边记着的坑是同一个。
-      TOOLS: ${{ (github.event_name != 'workflow_dispatch' || inputs.include_tsh) && 'teleport tsh' || 'teleport' }}
+      TOOLS: ${{ inputs.tools || ((github.event_name != 'workflow_dispatch' || inputs.include_tsh) && 'teleport tsh' || 'teleport') }}
     steps:
       - name: 检出本仓库(补丁与脚本)
         uses: actions/checkout@v4
@@ -302,7 +306,7 @@ jobs:
       REF: ${{ needs.resolve.outputs.ref }}
       VERSION: ${{ needs.resolve.outputs.version }}
       ARCH: arm64
-      TOOLS: ${{ (github.event_name != 'workflow_dispatch' || inputs.include_tsh) && 'teleport tsh' || 'teleport' }}
+      TOOLS: ${{ inputs.tools || ((github.event_name != 'workflow_dispatch' || inputs.include_tsh) && 'teleport tsh' || 'teleport') }}
     steps:
       - name: 检出本仓库(补丁与脚本)
         uses: actions/checkout@v4
